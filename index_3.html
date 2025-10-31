@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Green Laser • Gaussian Etch (trace-as-you-pass)</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+
+  /* Glowing center block WITH TEXT */
+  #block{
+    position:fixed;left:50%;top:50%;
+    width:60vmin;height:34vmin;
+    transform:translate(-50%,-50%);
+    background:rgba(0,20,10,0.22);
+    border:2px solid rgba(30,255,170,0.85);
+    border-radius:10px;
+    box-shadow:
+      0 0 12px rgba(30,255,170,0.85),
+      0 0 24px rgba(20,200,140,0.75),
+      0 0 48px rgba(10,160,110,0.55),
+      inset 0 0 25px rgba(0,120,80,0.35);
+    animation: glowPulse 3s ease-in-out infinite;
+
+    display:flex;align-items:center;justify-content:center;
+    text-align:center;pointer-events:none
+  }
+  #block .title{
+    line-height:1.15;color:#eafff4;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif;
+    text-shadow:
+      0 0 6px rgba(80,255,190,.8),
+      0 0 18px rgba(40,220,150,.6),
+      0 0 36px rgba(20,180,120,.45);
+  }
+  #block .title h1{margin:0 0 .35em;font-size:clamp(22px,5.2vmin,44px);letter-spacing:.06em}
+  #block .title p{margin:0;font-size:clamp(14px,3.2vmin,24px);opacity:.95}
+
+  @keyframes glowPulse{
+    0%,100%{ box-shadow:
+      0 0 10px rgba(50,255,180,0.75),
+      0 0 25px rgba(30,220,150,0.65),
+      0 0 60px rgba(20,180,120,0.5),
+      inset 0 0 20px rgba(0,140,95,0.28); }
+    50%{ box-shadow:
+      0 0 16px rgba(90,255,200,0.95),
+      0 0 38px rgba(50,230,160,0.85),
+      0 0 80px rgba(30,190,130,0.65),
+      inset 0 0 30px rgba(0,160,110,0.42); }
+  }
+
+  .hud{
+    position:fixed;left:10px;bottom:10px;color:#aaa;
+    font:12px system-ui,Segoe UI,Roboto,sans-serif;
+    background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.08);
+    border-radius:8px;padding:8px 10px;user-select:none
+  }
+  .hud code{color:#ddd}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<!-- Center block with text -->
+<div id="block" aria-hidden="true">
+  <div class="title">
+    <h1>INFO 511</h1>
+    <p>Foundations of Data Science</p>
+  </div>
+</div>
+
+<div class="hud">
+  Green laser • Gaussian etched only where the laser passes<br/>
+  <code>[</code>/<code>]</code> strings • <code>-</code>/<code>=</code> glow • <code>H</code> Hi/Perf
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha:false });
+  const blockEl = document.getElementById('block');
+
+  /* =================== TUNABLES =================== */
+
+  // --- String layout ---
+  let NUM_STRINGS   = 36;
+  let EDGE_PAD      = 60;
+  let STRING_JITTER = 10;
+  let STRING_FADE   = 0.06;
+
+  // --- Pulses (laser) ---
+  let SPAWN_RATE    = 1.2;         // live, adaptive value
+  let SPEED_RANGE   = [220, 380];
+  let PULSE_LEN     = [90, 220];
+  let CORE_ALPHA    = [0.75, 1.0];
+
+  // --- Glow look (for pulses) — GREEN palette ---
+  let CORE_WIDTH    = 1.2;
+  let BLOOM_WIDTH   = 10;
+  let MID_WIDTH     = 22;
+  let BLOOM_BLUR    = 28;
+  let MID_BLUR      = 14;
+
+  // laser colors (neon green vibe)
+  const G_BLOOM = [30,255,170];
+  const G_MID   = [20,220,150];
+  const G_CORE  = [230,255,245]; // near-white greenish core
+
+  // --- Sparks (base ranges) ---
+  let SPARK_COUNT   = [10, 18];
+  let SPARK_SPEED_X = [140, 320];
+  let SPARK_SPEED_Y = [160, 260];
+  let SPARK_GRAVITY = 360;
+  let SPARK_LIFE    = [0.9, 1.6];
+  let SPARK_DRAG    = 0.996;             // fallback
+  let SPARKINESS    = 1.0;               // live, adaptive value
+
+  // Spark size + trail
+  let SPARK_SIZE_BASE        = 1.6;
+  let SPARK_SIZE_BOUNCE_MULT = 1.9;
+  let SPARK_SIZE_MAX         = 5.0;
+  let SPARK_TRAIL_SECS       = 0.06;
+
+  // --- Quality/performance ---
+  let HIGH_QUALITY = false; // toggle with H
+  let DPR_CAP_HI   = 1.5;
+  let DPR_CAP_LO   = 1.1;
+
+  // --- Performance caps / pooling / LOD ---
+  const SPARK_BUDGET = 700;
+  const SPARK_TARGET = 520;
+  let SIMPLE_SPARK_MODE = false;
+  let sparkPool = [];
+  function getSpark(){ return sparkPool.pop() || {}; }
+  function freeSpark(s){ sparkPool.push(s); }
+
+  /* --- Gaussian etch (inside block) --- */
+  const GAUSS = {
+    mu: 0, sigma: 1, amp: 1, yBase: 0,
+    pts: [],                 // [{x,y}] across block width (CSS px)
+    etched: null,            // Uint8Array per x pixel; 1 only where laser passed
+    strokeWidth: 2.6,
+    glowBlur: 16
+  };
+
+  /* =================== STATE =================== */
+  let DPR=1,W=0,H=0;
+  let strings=[],pulses=[],sparks=[];
+  let blockRect={left:0,right:0,top:0,bottom:0};
+  let sparkSprite=null;
+
+  // Fixed timestep physics
+  let last = performance.now();
+  let acc  = 0;
+  const STEP = 1/60;
+  let ema  = 16.7;
+  let lastReseedCheck = performance.now();
+
+  /* =================== SETUP =================== */
+  function fit(){
+    const cap=HIGH_QUALITY?DPR_CAP_HI:DPR_CAP_LO;
+    DPR = Math.min(cap, Math.max(1, window.devicePixelRatio||1));
+    W = Math.floor(innerWidth*DPR);
+    H = Math.floor(innerHeight*DPR);
+    canvas.width = W; canvas.height = H;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    updateBlockRect();
+    buildStrings();
+    buildSparkSprite();
+    buildGaussian();     // recalc Gaussian across block
+  }
+
+  function updateBlockRect(){
+    const r=blockEl.getBoundingClientRect();
+    blockRect={left:r.left,right:r.right,top:r.top,bottom:r.bottom};
+  }
+
+  function buildStrings(){
+    strings=[];
+    const usableW=innerWidth-EDGE_PAD*2;
+    for(let i=0;i<NUM_STRINGS;i++){
+      const t=(i+0.5)/NUM_STRINGS;
+      const baseX=EDGE_PAD+t*usableW;
+      const jitter=(Math.random()*2-1)*STRING_JITTER;
+      strings.push({x:baseX+jitter});
+    }
+  }
+
+  function buildSparkSprite(){
+    const S=128,cv=document.createElement('canvas');cv.width=cv.height=S;
+    const c=cv.getContext('2d');
+    // green spark sprite
+    const g=c.createRadialGradient(S/2,S/2,1,S/2,S/2,S/2);
+    g.addColorStop(0,'rgba(255,255,255,1)');
+    g.addColorStop(0.25,'rgba(200,255,240,0.95)');
+    g.addColorStop(0.55,'rgba(60,255,180,0.55)');
+    g.addColorStop(1,'rgba(0,180,120,0)');
+    c.fillStyle=g;c.beginPath();c.arc(S/2,S/2,S/2,0,Math.PI*2);c.fill();
+    sparkSprite=cv;
+  }
+
+  function buildGaussian(){
+    const left  = Math.floor(blockRect.left);
+    const right = Math.ceil(blockRect.right);
+    const width = Math.max(2, right - left);
+    const top   = blockRect.top;
+    const height= blockRect.bottom - blockRect.top;
+
+    // Gaussian params (screen space, centered in block)
+    GAUSS.mu    = (left + right) / 2;
+    GAUSS.sigma = Math.max(20, (right - left) * 0.28);
+    GAUSS.amp   = Math.max(12, height * 0.38);
+    GAUSS.yBase = top + height * 0.62;
+
+    GAUSS.pts = [];
+    for (let x = left; x <= right; x++){
+      const dx = x - GAUSS.mu;
+      const y = GAUSS.yBase - GAUSS.amp * Math.exp(-(dx*dx) / (2*GAUSS.sigma*GAUSS.sigma));
+      GAUSS.pts.push({ x, y });
+    }
+
+    // one slot per CSS pixel across the full viewport (quick indexing)
+    GAUSS.etched = new Uint8Array(innerWidth);
+  }
+
+  /* =================== HELPERS =================== */
+  const rand=(a,b)=>a+Math.random()*(b-a);
+
+  function spawnPulseForString(sx){
+    pulses.push({ x:sx, y:-rand(40,140), len:rand(...PULSE_LEN),
+      speed:rand(...SPEED_RANGE), alpha:rand(...CORE_ALPHA), sparked:false });
+  }
+
+  function seedPulses(){
+    pulses.length=0;
+    for(const s of strings){
+      if(Math.random()<0.6){
+        pulses.push({ x:s.x, y:rand(0,innerHeight*0.8), len:rand(...PULSE_LEN),
+          speed:rand(...SPEED_RANGE), alpha:rand(...CORE_ALPHA), sparked:false });
+      }
+    }
+  }
+
+  function etchGaussianAtX(x){
+    // mark EXACT x as etched (no neighborhood fill)
+    const xi = x|0;
+    if (xi>=0 && xi<GAUSS.etched.length) GAUSS.etched[xi] = 1;
+  }
+
+  /* =================== DRAWING =================== */
+  function drawStringBase(x){
+    if(STRING_FADE<=0)return;
+    ctx.globalCompositeOperation='source-over';
+    ctx.strokeStyle=`rgba(60,255,180,${STRING_FADE*0.16})`;
+    ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,innerHeight);ctx.stroke();
+  }
+
+  function strokeSegment(x,y1,y2,col,width,blur,alpha){
+    ctx.globalCompositeOperation='screen';ctx.lineCap='round';
+    ctx.shadowColor=`rgba(${col[0]},${col[1]},${col[2]},${alpha})`;
+    ctx.shadowBlur=blur;ctx.strokeStyle=`rgba(${col[0]},${col[1]},${col[2]},${alpha})`;
+    ctx.lineWidth=width;ctx.beginPath();ctx.moveTo(x,y1);ctx.lineTo(x,y2);ctx.stroke();
+  }
+
+  function drawPulse(p){
+    const y2=p.y,y1=p.y-p.len;if(y2<=y1)return;
+    // GREEN laser beam
+    strokeSegment(p.x,y1,y2,G_MID,  MID_WIDTH,  MID_BLUR,  0.24*p.alpha);
+    strokeSegment(p.x,y1,y2,G_BLOOM,BLOOM_WIDTH,BLOOM_BLUR,0.18*p.alpha);
+    ctx.globalCompositeOperation='screen';ctx.lineCap='round';
+    ctx.shadowColor=`rgba(${G_CORE[0]},${G_CORE[1]},${G_CORE[2]},${0.9*p.alpha})`;
+    ctx.shadowBlur=6;ctx.strokeStyle=`rgba(${G_CORE[0]},${G_CORE[1]},${G_CORE[2]},${0.9*p.alpha})`;
+    ctx.lineWidth=CORE_WIDTH;ctx.beginPath();ctx.moveTo(p.x,y1);ctx.lineTo(p.x,y2);ctx.stroke();
+  }
+
+  function drawGaussianEtched(){
+    if (!GAUSS.pts.length) return;
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'screen';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.shadowColor = 'rgba(60,255,180,0.85)';
+    ctx.shadowBlur  = GAUSS.glowBlur;
+    ctx.strokeStyle = 'rgba(210,255,235,0.95)';
+    ctx.lineWidth   = GAUSS.strokeWidth;
+
+    // Draw only the segments whose x pixels have been etched
+    ctx.beginPath();
+    let drawing = false;
+    for (let i=0;i<GAUSS.pts.length;i++){
+      const px = GAUSS.pts[i].x|0;
+      if (px<0 || px>=GAUSS.etched.length) continue;
+      if (GAUSS.etched[px]){
+        if (!drawing){ ctx.moveTo(GAUSS.pts[i].x, GAUSS.pts[i].y); drawing = true; }
+        else { ctx.lineTo(GAUSS.pts[i].x, GAUSS.pts[i].y); }
+      } else if (drawing){
+        ctx.stroke(); ctx.beginPath(); drawing = false;
+      }
+    }
+    if (drawing) ctx.stroke();
+    ctx.restore();
+  }
+
+  // Sparks (LOD + pooling kept for smoothness)
+  function spawnSparks(x,y,a){
+    let n = Math.floor(rand(...SPARK_COUNT) * SPARKINESS);
+    const capacity = Math.max(0, SPARK_BUDGET - sparks.length);
+    if (capacity <= 0) return;
+    if (n > capacity) n = capacity;
+
+    for (let i=0;i<n;i++){
+      const dir = Math.random()<0.5 ? -1 : 1;
+      const spread = (Math.random()*0.9 - 0.45);
+      const spx = rand(...SPARK_SPEED_X);
+      const spy = rand(...SPARK_SPEED_Y);
+
+      const s = getSpark();
+      s.x = x; s.y = y;
+      s.vx = dir*spx*Math.cos(spread);
+      s.vy = -spy*Math.cos(spread*0.5);
+      s.life = rand(...SPARK_LIFE);
+      s.alpha = a*rand(0.75,1);
+      s.size = SPARK_SIZE_BASE * rand(0.9, 1.35);
+      s.restitution = rand(0.25, 0.55);
+      s.drag        = rand(0.990, 0.998);
+      s.fricX       = rand(0.80, 0.97);
+      s.twinkle     = Math.random()*Math.PI*2;
+      s.jitter      = rand(0.0, 18.0);
+      sparks.push(s);
+    }
+  }
+
+  function drawSpark(s){
+    if(!sparkSprite) return;
+    const k = s.size||1;
+    const sp = Math.hypot(s.vx,s.vy);
+    const ang = Math.atan2(s.vy,s.vx);
+    const tw = 0.12*Math.sin(performance.now()/120 + s.twinkle);
+    const baseAlpha = Math.max(0, Math.min(1, s.alpha + tw));
+
+    ctx.save();
+    ctx.globalCompositeOperation='screen';
+    ctx.translate(s.x,s.y);
+    ctx.rotate(ang);
+
+    // Single-pass when slow/low-energy
+    const SIMPLE = SIMPLE_SPARK_MODE || sp<200 || baseAlpha<0.35;
+    if (SIMPLE){
+      const d = 12*k;
+      ctx.globalAlpha = 0.75*baseAlpha;
+      ctx.drawImage(sparkSprite, -d/2, -d/2, d, d);
+    } else {
+      const len   = Math.max(10, sp*SPARK_TRAIL_SECS*k);
+      const thick = 4*k;
+      ctx.globalAlpha = 0.40*baseAlpha;
+      ctx.drawImage(sparkSprite,-len*0.6,-thick*1.2,len*1.2,thick*2.4);
+      ctx.globalAlpha = 0.85*baseAlpha;
+      ctx.drawImage(sparkSprite,-len*0.5,-thick*0.55,len*1.0,thick*1.1);
+    }
+    ctx.restore();
+  }
+
+  /* =================== PHYSICS =================== */
+  function updateLoadFlags(){
+    SIMPLE_SPARK_MODE = (sparks.length > SPARK_TARGET || ema > 20);
+  }
+
+  function stepPhysics(dt, now){
+    ema = ema*0.9 + (dt*1000)*0.1;
+    updateLoadFlags();
+
+    // drift back to baseline (keep scene steady)
+    const homeo = 0.40 * dt;
+    SPAWN_RATE  += (1.2 - SPAWN_RATE) * homeo;
+    SPARKINESS  += (1.0 - SPARKINESS) * homeo;
+
+    // occasional reseed if scene goes sparse
+    if (now - lastReseedCheck > 3000){
+      lastReseedCheck = now;
+      const minPulse = Math.max(10, Math.floor(NUM_STRINGS*0.35));
+      if (pulses.length < minPulse){
+        for (let i=0;i<12;i++){
+          const s = strings[Math.floor(Math.random()*strings.length)];
+          if(!s) break;
+          pulses.push({ x:s.x, y:-Math.random()*50-10, len:rand(...PULSE_LEN),
+            speed:rand(...SPEED_RANGE), alpha:rand(...CORE_ALPHA), sparked:false });
+        }
+      }
+    }
+
+    // spawn along strings (mild throttle when heavy)
+    const spawnBoost = SIMPLE_SPARK_MODE ? 0.8 : 1.0;
+    for (const s of strings){
+      if (Math.random() < SPAWN_RATE * dt * spawnBoost) spawnPulseForString(s.x);
+    }
+
+    // pulses update + impacts (ETCH on block hit)
+    for (let i=pulses.length-1;i>=0;i--){
+      const p=pulses[i];
+      p.y += p.speed * dt;
+      const x=p.x, y1=p.y-p.len, y2=p.y;
+      if(!p.sparked && x>=blockRect.left && x<=blockRect.right && y2>=blockRect.top && y1<=blockRect.top){
+        p.sparked = true;
+        spawnSparks(x, blockRect.top, p.alpha);
+        etchGaussianAtX(x);   // <-- precise etch at the impact x
+        pulses.splice(i,1);
+        continue;
+      }
+      if(p.y - p.len > innerHeight + 80){ pulses.splice(i,1); continue; }
+    }
+
+    // sparks physics + pooling
+    for (let i=sparks.length-1;i>=0;i--){
+      const s=sparks[i];
+      s.life -= dt; if (s.life<=0){ sparks.splice(i,1); freeSpark(s); continue; }
+
+      s.vy += SPARK_GRAVITY * dt;
+
+      const dragPow = Math.pow(s.drag ?? SPARK_DRAG, dt*60);
+      s.vx *= dragPow;
+      s.vy *= dragPow*0.999;
+
+      const tw = Math.sin(now/120 + s.twinkle) * 0.6;
+      s.vx += (s.jitter*0.02) * tw * dt;
+
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+
+      if (s.y>=blockRect.top && s.y<=blockRect.bottom &&
+          s.x>=blockRect.left && s.x<=blockRect.right && s.vy>0){
+        s.vy = -s.vy * (s.restitution ?? 0.45);
+        s.vx *= (s.fricX ?? 0.9);
+        s.y  = blockRect.top - 0.1;
+        s.size  = Math.min(SPARK_SIZE_MAX, (s.size||1) * SPARK_SIZE_BOUNCE_MULT);
+        s.alpha = Math.min(1, s.alpha * 1.08);
+      }
+
+      if (s.y>innerHeight+220 || s.x<-220 || s.x>innerWidth+220){
+        sparks.splice(i,1); freeSpark(s);
+      }
+    }
+  }
+
+  function render(){
+    ctx.globalCompositeOperation='source-over';
+    ctx.fillStyle='#000';
+    ctx.fillRect(0,0,innerWidth,innerHeight);
+
+    // Strings + green laser
+    for (const s of strings) drawStringBase(s.x);
+    for (const p of pulses)  drawPulse(p);
+
+    // Gaussian etched ONLY where laser passed
+    drawGaussianEtched();
+
+    // Sparks
+    ctx.globalCompositeOperation='screen';
+    for (const s of sparks)  drawSpark(s);
+  }
+
+  function tick(now){
+    const dt = Math.min(0.05, (now - last)/1000);
+    last = now;
+    acc += dt;
+
+    while (acc >= STEP){
+      stepPhysics(STEP, now);
+      acc -= STEP;
+    }
+
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  /* =================== CONTROLS =================== */
+  window.addEventListener('keydown',e=>{
+    if(e.key.toLowerCase()==='h'){HIGH_QUALITY=!HIGH_QUALITY;fit();}
+    if(e.key==='['){ NUM_STRINGS=Math.max(6,NUM_STRINGS-4); buildStrings(); }
+    if(e.key===']'){ NUM_STRINGS=Math.min(120,NUM_STRINGS+4); buildStrings(); }
+    if(e.key==='-'){ BLOOM_BLUR=Math.max(6,BLOOM_BLUR-2); MID_BLUR=Math.max(4,MID_BLUR-2); MID_WIDTH=Math.max(12,MID_WIDTH-2); BLOOM_WIDTH=Math.max(8,BLOOM_WIDTH-2); }
+    if(e.key==='='){ BLOOM_BLUR=Math.min(44,BLOOM_BLUR+2); MID_BLUR=Math.min(28,MID_BLUR+2); MID_WIDTH=Math.min(40,MID_WIDTH+2); BLOOM_WIDTH=Math.min(26,BLOOM_WIDTH+2); }
+  });
+
+  /* =================== BOOT =================== */
+  addEventListener('resize',()=>{fit();updateBlockRect();buildGaussian();});
+  fit();
+  requestAnimationFrame(updateBlockRect);
+  seedPulses();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

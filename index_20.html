@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Laser Etch — Gaussian → Text Block → Breakaway Reveal</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#000;
+      --slab:#0c0d10;
+      --frame:#13151a;
+    }
+    html,body{
+      margin:0;
+      height:100%;
+      background:var(--bg);
+      color:#e9fff5;
+      font:14px/1.25 ui-monospace,Consolas,Menlo,monospace;
+    }
+    .wrap{
+      display:grid;
+      place-items:center;
+      min-height:100%;
+    }
+    canvas{
+      display:block;
+      width:min(100vw,1280px);
+      height:auto;
+      max-height:92vh;
+      border-radius:12px;
+      box-shadow:0 18px 60px rgba(0,0,0,.55);
+    }
+    .hud{
+      position:fixed;
+      left:50%;
+      top:10px;
+      transform:translateX(-50%);
+      background:rgba(0,0,0,.45);
+      border:1px solid rgba(255,255,255,.08);
+      padding:6px 10px;
+      border-radius:8px;
+      color:#bfffe9;
+      font:13px Consolas,monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="c" width="1280" height="720"></canvas>
+  </div>
+  <div class="hud" id="hud">Phase: 1/4 — Gaussian</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const hud = document.getElementById('hud');
+
+  // layers
+  const bg   = mk(W,H), bgCtx   = bg.getContext('2d');
+  const slab = mk(W,H), slabCtx = slab.getContext('2d');
+  const glow = mk(W,H), glowCtx = glow.getContext('2d');
+  const curve = mk(W,H), curveCtx = curve.getContext('2d');
+  const live  = mk(W,H), liveCtx  = live.getContext('2d');
+  const textMask = mk(W,H), textMaskCtx = textMask.getContext('2d');
+  const textFinal = mk(W,H), textFinalCtx = textFinal.getContext('2d');
+  const textBlock = mk(W,H), textBlockCtx = textBlock.getContext('2d'); // this is the "cover" block
+
+  // background
+  bgCtx.fillStyle = "#000";
+  bgCtx.fillRect(0,0,W,H);
+
+  // layout
+  const rect = { x:Math.floor(W*0.12), y:Math.floor(H*0.18), w:Math.floor(W*0.76), h:Math.floor(H*0.64) };
+  const bbox = inset(rect, Math.floor(rect.w*0.08), Math.floor(rect.h*0.12), Math.floor(rect.w*0.08), Math.floor(rect.h*0.16));
+  const baseY = bbox.y + bbox.h;
+
+  // slab
+  slabCtx.fillStyle = "#0c0d10";
+  rr(slabCtx, rect.x, rect.y, rect.w, rect.h, 12); slabCtx.fill();
+
+  // gaussian path
+  const upper = gaussianUpperPolyline(620, bbox);
+  const upperPath = densify(upper, 2);
+
+  // baseline (close curve)
+  const basePts = [];
+  for (let i=upperPath.length-1;i>=0;i--) basePts.push([upperPath[i][0], baseY]);
+  const baseline = densify(basePts, 3);
+  const closed = upperPath.concat(baseline);
+  const U = upperPath.length;
+  const N = closed.length;
+
+  // gaussian corner to park at: left baseline corner
+  const parkPoint = { x: upperPath[0][0], y: baseY };
+
+  // curve draw style
+  curveCtx.lineCap   = "round";
+  curveCtx.lineJoin  = "round";
+  curveCtx.strokeStyle = "rgba(140,255,210,1)";
+  curveCtx.shadowColor = "rgba(60,255,180,0.9)";
+  curveCtx.shadowBlur  = 16;
+  curveCtx.lineWidth   = 3;
+
+  // text setup (centered horizontally)
+  const L1 = "INFO 510";
+  const L2 = "Bayesian Modelling and Inference";
+  const fontL1 = "bold 50px Consolas,ui-monospace,monospace";
+  const fontL2 = "bold 46px Consolas,ui-monospace,monospace";
+  textMaskCtx.textAlign = "center";
+  textMaskCtx.textBaseline = "middle";
+  const tx = rect.x + rect.w/2;
+  const raiseFactor = 0.16;
+  const centroid = polygonCentroid(closed);
+  const tyRaise = Math.round(bbox.h * raiseFactor);
+  const tyCenter = Math.round(clamp(bbox.y+60, bbox.y+bbox.h-60, centroid.y - tyRaise));
+  const lineGap = 56;
+  const y1 = tyCenter - lineGap/2;
+  const y2 = tyCenter + lineGap/2;
+  textMaskCtx.fillStyle = "#fff";
+  textMaskCtx.shadowColor = "rgba(60,255,180,0.85)";
+  textMaskCtx.shadowBlur = 6;
+  textMaskCtx.font = fontL1; const tw1 = textMaskCtx.measureText(L1).width;
+  textMaskCtx.fillText(L1, tx, y1);
+  textMaskCtx.font = fontL2; const tw2 = textMaskCtx.measureText(L2).width;
+  textMaskCtx.fillText(L2, tx, y2);
+  const textAlphaData = textMaskCtx.getImageData(0,0,W,H).data;
+
+  // rectangle around text — this is what we "cut" in phase 2
+  const textW = Math.max(tw1, tw2);
+  const padX = 90;
+  const padY = 50;
+  const textRect = {
+    x: tx - textW/2 - padX,
+    y: y1 - padY,
+    w: textW + 2*padX,
+    h: (y2 - y1) + 2*padY
+  };
+
+  // paint text block (the cover)
+  textBlockCtx.fillStyle = "#050505";
+  textBlockCtx.globalAlpha = 0.95;
+  rr(textBlockCtx, textRect.x, textRect.y, textRect.w, textRect.h, 12);
+  textBlockCtx.fill();
+  textBlockCtx.globalAlpha = 1;
+
+  // rectangle path (four sides)
+  const rectPath = buildRectPath(textRect, 4); // densified
+
+  // sparks
+  const SP = {
+    MAX: 2000,
+    EMIT: 1600,
+    GRAV: 980,
+    DRAG: 0.995,
+    LIFE: [0.6,1.3],
+    VT: [240,520],
+    VN: [-180,180],
+    JIT: [-30,30],
+    BOUNCE: 0.35
+  };
+  const sparkSprite = makeSparkSprite();
+  const sparks = new Array(SP.MAX);
+  let sparkCount = 0;
+
+  // multi-beams
+  const beams = [
+    { baseX: W/2,          baseY: rect.y - 80, phase: 0.0, freq: 1.7, amp: 1.0, merge:0 },
+    { baseX: rect.x - 80,  baseY: rect.y - 40, phase: 0.7, freq: 2.5, amp: 0.95, merge:0 },
+    { baseX: rect.x+rect.w+80, baseY: rect.y - 30, phase: 1.3, freq: 1.2, amp: 0.9, merge:0 },
+  ];
+  const MERGE_SPEED = 0.9; // sec-ish to merge
+  const mergeTarget = { x: parkPoint.x, y: rect.y - 110 }; // above corner
+
+  // phases
+  const PHASE = { CURVE:0, RECT:1, MERGE:2, REVEAL:3 };
+  let phase = PHASE.CURVE;
+
+  let last = performance.now();
+  let progCurve = 0;   // 0..1 along gaussian
+  let progRect  = 0;   // 0..1 along rectangle
+  let lastUpper = null, lastBase = null;
+
+  // reveal timing
+  let revealStart = null;
+  const REVEAL_DUR = 1.0;  // how long the block "falls apart"
+  const TEXT_FADE_DUR = 1.0; // text fade in
+
+  hudUpdate();
+  requestAnimationFrame(loop);
+
+  function loop(now){
+    const dt = Math.min((now - last)/1000, 0.1);
+    last = now;
+    const t = now*0.001;
+    glowCtx.clearRect(0,0,W,H);
+    liveCtx.clearRect(0,0,W,H);
+
+    const basePower = clamp(0.35, 1, 0.9 + 0.35*(noise1d(t*11.7)*0.6 + noise1d(t*3.9)*0.4));
+    const widthCore = 1.4 + 0.8*(noise1d(t*7.3)*0.5 + 0.5);
+
+    // ===== phase 0: gaussian =====
+    if (phase === PHASE.CURVE){
+      progCurve += 0.28*dt;
+      if (progCurve >= 1){
+        progCurve = 1;
+        phase = PHASE.RECT;
+        hudUpdate();
+      }
+
+      const {i,tt,x0,y0,x1,y1} = segAt(closed, progCurve);
+      const lx = x0 + (x1-x0)*tt;
+      const ly = y0 + (y1-y0)*tt;
+      const [txv, tyv] = tangentAt(closed, i);
+
+      // draw beams from their start to laser head
+      for (const b of beams){
+        const pwr = flickerPower(basePower, t, b.phase, b.freq, b.amp);
+        drawBeam(glowCtx, b.baseX, b.baseY, lx, ly, widthCore, pwr);
+      }
+
+      // sparks
+      emitSparks(lx,ly,txv,tyv,basePower,1.0,dt);
+
+      // carve curve
+      if (inside(lx,ly,rect)){
+        carveSlab(slabCtx, lx, ly, centroid, basePower);
+      }
+
+      // trace visible curve
+      traceCurve(curveCtx, closed, U, N, iFromProgress(progCurve,N), tt, lastUpper, lastBase);
+      lastUpper = window._lastUpper;
+      lastBase  = window._lastBase;
+
+      // live pulse
+      drawLiveCircle(liveCtx, lx, ly, "rgba(155,255,210,1)", 20);
+    }
+
+    // ===== phase 1: rectangle around text =====
+    else if (phase === PHASE.RECT){
+      progRect += 0.4*dt;
+      if (progRect >= 1){
+        progRect = 1;
+        phase = PHASE.MERGE;
+        hudUpdate();
+      }
+
+      const {i,tt,x0,y0,x1,y1} = segAt(rectPath, progRect);
+      const lx = x0 + (x1-x0)*tt;
+      const ly = y0 + (y1-y0)*tt;
+      const [txv,tyv] = tangentAt(rectPath, i);
+
+      // draw beams to rectangle head
+      for (const b of beams){
+        const pwr = flickerPower(basePower, t, b.phase, b.freq, b.amp);
+        drawBeam(glowCtx, b.baseX, b.baseY, lx, ly, widthCore, pwr);
+      }
+
+      emitSparks(lx,ly,txv,tyv,basePower,0.9,dt);
+
+      // carve slab along rectangle
+      carveSlab(slabCtx, lx, ly, {x:lx,y:ly}, basePower*0.9, 5);
+
+      drawLiveCircle(liveCtx, lx, ly, "rgba(155,255,210,1)", 16);
+    }
+
+    // ===== phase 2: merge beams to corner =====
+    else if (phase === PHASE.MERGE){
+      let allMerged = true;
+      for (const b of beams){
+        b.merge = Math.min(1, b.merge + MERGE_SPEED*dt);
+        const sx = lerp(b.baseX, mergeTarget.x, b.merge);
+        const sy = lerp(b.baseY, mergeTarget.y, b.merge);
+        const pwr = 0.55 + 0.4*(0.5+0.5*Math.sin(t*9 + b.phase));
+        drawBeam(glowCtx, sx, sy, parkPoint.x, parkPoint.y, 2.0, pwr);
+        if (b.merge < 1) allMerged = false;
+      }
+      emitSparks(parkPoint.x, parkPoint.y, 0,1, 0.55, 0.6, dt);
+
+      if (allMerged){
+        phase = PHASE.REVEAL;
+        revealStart = now/1000.0;
+        hudUpdate();
+      }
+    }
+
+    // ===== phase 3: block falls apart, text fades in =====
+    else if (phase === PHASE.REVEAL){
+      const time = now/1000.0;
+      const el = time - revealStart;
+      const p = clamp(0,1, el / REVEAL_DUR);
+
+      // keep one beam cutting in place, vertical
+      drawBeam(glowCtx, mergeTarget.x, mergeTarget.y, parkPoint.x, parkPoint.y, 2.0, 0.75 + 0.2*Math.sin(t*10));
+      emitSparks(parkPoint.x, parkPoint.y, 0,1, 0.55, 0.4, dt);
+
+      // we'll just let p drive the block split + text fade
+      // done in composeFrame
+    }
+
+    // draw frame
+    const nowSec = now/1000.0;
+    composeFrame(nowSec);
+    requestAnimationFrame(loop);
+  }
+
+  function composeFrame(nowSec){
+    ctx.drawImage(bg,0,0);
+    ctx.drawImage(slab,0,0);
+
+    // curve layer (already glowing green)
+    ctx.globalCompositeOperation='screen';
+    ctx.drawImage(curve,0,0);
+
+    // TEXT BLOCK COVER or BREAK
+    if (phase === 0 || phase === 1 || phase === 2){
+      // full cover on top
+      ctx.globalCompositeOperation='source-over';
+      ctx.drawImage(textBlock,0,0);
+    } else if (phase === 3){
+      // split the block
+      const t = nowSec - (revealStart||nowSec);
+      const p = clamp(0,1, t / REVEAL_DUR);
+      const off = 200 * p; // how far panels fly
+      // left panel
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(textRect.x - off, textRect.y, textRect.w/2, textRect.h);
+      ctx.clip();
+      ctx.drawImage(textBlock,0,0);
+      ctx.restore();
+      // right panel
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(textRect.x + textRect.w/2 + off, textRect.y, textRect.w/2, textRect.h);
+      ctx.clip();
+      ctx.drawImage(textBlock,0,0);
+      ctx.restore();
+    }
+
+    // live laser marks
+    ctx.globalCompositeOperation='lighter';
+    ctx.drawImage(live,0,0);
+
+    // glow (beams + sparks)
+    ctx.drawImage(glow,0,0);
+
+    // TEXT FADE IN (after block splits)
+    if (phase === 3 && revealStart != null){
+      const el = nowSec - revealStart;
+      const ap = clamp(0,1, (el - 0.05) / TEXT_FADE_DUR); // small offset so text appears just after block
+      if (ap > 0){
+        // colorize whole textMask
+        const tmp = mk(W,H), tmpCtx = tmp.getContext('2d');
+        tmpCtx.drawImage(textMask,0,0);
+        tmpCtx.globalCompositeOperation='source-in';
+        tmpCtx.fillStyle = "rgba(140,255,210,1)";
+        tmpCtx.fillRect(0,0,W,H);
+        ctx.globalAlpha = ap;
+        ctx.globalCompositeOperation='screen';
+        ctx.drawImage(tmp,0,0);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // frame
+    ctx.globalCompositeOperation='source-over';
+    ctx.strokeStyle = "#13151a";
+    ctx.lineWidth = 1.2;
+    rr(ctx, rect.x, rect.y, rect.w, rect.h, 12); ctx.stroke();
+  }
+
+  function hudUpdate(){
+    hud.textContent =
+      (phase===0) ? "Phase: 1/4 — Gaussian"
+    : (phase===1) ? "Phase: 2/4 — Cutting text block"
+    : (phase===2) ? "Phase: 3/4 — Lasers returning to Gaussian corner"
+    : "Phase: 4/4 — Block break + text reveal";
+  }
+
+  // ------------------------------------------------------------
+  // helpers
+  // ------------------------------------------------------------
+  function carveSlab(g, lx, ly, centroid, power, kerf=6){
+    g.save();
+    g.globalCompositeOperation='destination-out';
+    const rad = kerf + 1.5;
+    const gr = g.createRadialGradient(lx,ly,0,lx,ly,rad);
+    gr.addColorStop(0,`rgba(0,0,0,${(0.35*power).toFixed(3)})`);
+    gr.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle = gr;
+    g.beginPath(); g.arc(lx,ly,kerf,0,Math.PI*2); g.fill();
+    // optional wedge
+    const vx = centroid.x - lx, vy = centroid.y - ly;
+    const m = Math.hypot(vx,vy)||1;
+    const ux = vx/m, uy = vy/m;
+    const wx = -uy, wy = ux;
+    const L = 40*(0.6+0.4*power);
+    const Wd = 20;
+    g.beginPath();
+    g.moveTo(lx,ly);
+    g.lineTo(lx+ux*L+wx*(Wd*0.5), ly+uy*L+wy*(Wd*0.5));
+    g.lineTo(lx+ux*L-wx*(Wd*0.5), ly+uy*L-wy*(Wd*0.5));
+    g.closePath();
+    g.fillStyle = `rgba(0,0,0,${(0.2*power).toFixed(3)})`;
+    g.fill();
+    g.restore();
+  }
+
+  function traceCurve(g, closed, U, N, i, tt, lastU, lastB){
+    const STEPS = 10;
+    const idxf = i + tt;
+    for (let s=0;s<=STEPS;s++){
+      const k = clamp(0, N-1-1e-4, idxf - (STEPS-s)*0.25);
+      const ki = Math.floor(k);
+      const kt = k - ki;
+      const [ax,ay] = closed[ki];
+      const [bx,by] = closed[ki+1] ?? closed[ki];
+      const sx = ax + (bx-ax)*kt;
+      const sy = ay + (by-ay)*kt;
+      g.beginPath();
+      if (ki < U-1){
+        if (lastU==null || ki<lastU || ki-lastU>50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastU]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastU=ki; lastB=null;
+      } else {
+        if (lastB==null || ki<lastB || ki-lastB>50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastB]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastB=ki; lastU=null;
+      }
+    }
+    window._lastUpper = lastU;
+    window._lastBase  = lastB;
+  }
+
+  function buildRectPath(r, step){
+    // return dense loop: top -> right -> bottom -> left -> back to start
+    const pts = [];
+    const {x,y,w,h} = r;
+    const corners = [
+      [x,y],
+      [x+w,y],
+      [x+w,y+h],
+      [x,y+h],
+      [x,y]
+    ];
+    return densify(corners, step);
+  }
+
+  function drawLiveCircle(g, x,y, col, r){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    const gr = g.createRadialGradient(x,y,0,x,y,r);
+    gr.addColorStop(0,col);
+    gr.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle=gr;
+    g.beginPath(); g.arc(x,y,r,0,Math.PI*2); g.fill();
+    g.restore();
+  }
+
+  function drawBeam(g,x0,y0,x1,y1,w,p){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    g.strokeStyle = `rgba(30,255,170,${(0.45*p).toFixed(3)})`;
+    g.lineWidth = w+6; g.lineCap='round';
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.strokeStyle = `rgba(230,255,245,${(Math.max(0.05,p)).toFixed(3)})`;
+    g.lineWidth = w;
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.fillStyle = `rgba(30,255,170,0.65)`;
+    for (let i=0;i<3;i++){ g.beginPath(); g.arc(x1,y1, 6+i*6, 0, Math.PI*2); g.fill(); }
+    g.restore();
+  }
+
+  function emitSparks(lx,ly,tx,ty,power,emit,dt){
+    const nx = -ty, ny = tx;
+    const want = SP.EMIT * power * emit * dt;
+    const count = Math.min(Math.floor(want + Math.random()), SP.MAX - sparkCount);
+    for (let i=0;i<count;i++){
+      const vT = rand(SP.VT[0], SP.VT[1]);
+      const vN = rand(SP.VN[0], SP.VN[1]);
+      const jx = rand(SP.JIT[0], SP.JIT[1]);
+      const jy = rand(SP.JIT[0], SP.JIT[1]);
+      const vx = tx*vT + nx*vN + jx;
+      const vy = ty*vT + ny*vN + jy;
+      const life = rand(SP.LIFE[0], SP.LIFE[1]);
+      const size = rand(1.1,2.7);
+      newSpark(lx,ly,vx,vy,life,size);
+    }
+    renderSparks(glowCtx,dt);
+  }
+
+  function renderSparks(g,dt){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    const drag = Math.pow(SP.DRAG, dt*60);
+    const top = rect.y;
+    let write=0;
+    for (let i=0;i<sparkCount;i++){
+      const s = sparks[i];
+      s.life -= dt; if (s.life<=0) continue;
+      s.vx *= drag; s.vy = s.vy*drag + SP.GRAV*dt;
+      s.x += s.vx*dt; s.y += s.vy*dt;
+      if (s.y>=top && s.y<=top+2 && s.vy>0 && s.x>=rect.x && s.x<=rect.x+rect.w){
+        s.y = top-0.1; s.vy *= -SP.BOUNCE; s.vx *= 0.9;
+      }
+      if (s.x<-200 || s.x>W+200 || s.y<-200 || s.y>H+300) continue;
+
+      const spd = Math.hypot(s.vx,s.vy);
+      const len = Math.max(8, spd*0.055);
+      const th = Math.max(2, s.size*2);
+      const ang = Math.atan2(s.vy,s.vx);
+
+      g.translate(s.x,s.y); g.rotate(ang);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life));
+      g.drawImage(sparkSprite, -len*0.7, -th*1.0, len*1.4, th*2.0);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life*1.1));
+      g.drawImage(sparkSprite, -len*0.4, -th*0.5, len*0.8, th);
+      g.setTransform(1,0,0,1,0,0);
+      sparks[write++] = s;
+    }
+    sparkCount = write;
+    g.restore();
+  }
+
+  function newSpark(x,y,vx,vy,life,size){
+    if (sparkCount >= SP.MAX) return;
+    sparks[sparkCount++] = {x,y,vx,vy,life,size};
+  }
+
+  function makeSparkSprite(){
+    const S=92, cv=document.createElement('canvas'); cv.width=cv.height=S;
+    const c=cv.getContext('2d');
+    const g=c.createRadialGradient(S/2,S/2,1,S/2,S/2,S/2);
+    g.addColorStop(0,'rgba(255,255,255,1)');
+    g.addColorStop(0.15,'rgba(230,255,245,0.98)');
+    g.addColorStop(0.5,'rgba(140,255,210,0.6)');
+    g.addColorStop(1,'rgba(140,255,210,0)');
+    c.fillStyle=g; c.beginPath(); c.arc(S/2,S/2,S/2,0,Math.PI*2); c.fill();
+    return cv;
+  }
+
+  function flickerPower(base, t, phase, freq, amp){
+    const slow = 0.5 + 0.5 * Math.sin(2*Math.PI*(t*freq + phase));
+    const fast = 0.25 + 0.75 * (0.5 + 0.5*Math.sin(2*Math.PI*(t*freq*3.1 + phase*2)));
+    const noise = 0.25*(noise1d(t*freq*0.9 + phase*7.7) - 0.5);
+    return clamp(0.25,1.05, base*(1-amp) + base*amp*slow + fast*0.2 + noise);
+  }
+
+  // geom & utils
+  function gaussianUpperPolyline(samples, box){
+    const pts=[];
+    for (let i=0;i<samples;i++){
+      const x = -3 + 6*(i/(samples-1));
+      const y = Math.exp(-0.5*x*x);
+      const sx= box.x + ((x+3)/6)*box.w;
+      const sy= box.y + box.h - y*box.h;
+      pts.push([sx,sy]);
+    }
+    return pts;
+  }
+  function densify(pts, step=2){
+    const out=[];
+    for (let i=0;i<pts.length-1;i++){
+      const [x0,y0] = pts[i], [x1,y1] = pts[i+1];
+      const dx=x1-x0, dy=y1-y0, len=Math.hypot(dx,dy);
+      const n = Math.max(1, Math.floor(len/step));
+      for (let s=0;s<n;s++){
+        const t=s/n;
+        out.push([x0+dx*t, y0+dy*t]);
+      }
+    }
+    out.push(pts.at(-1));
+    return out;
+  }
+  function polygonCentroid(pts){ let sx=0,sy=0; for(const p of pts){ sx+=p[0]; sy+=p[1]; } return {x:sx/pts.length, y:sy/pts.length}; }
+  function tangentAt(path,i){
+    const N=path.length;
+    const i0 = Math.max(0, Math.min(N-1, i-1));
+    const i1 = Math.max(0, Math.min(N-1, i+1));
+    const [x0,y0]=path[i0], [x1,y1]=path[i1];
+    const dx=x1-x0, dy=y1-y0, m=Math.hypot(dx,dy)||1;
+    return [dx/m, dy/m];
+  }
+  function segAt(path, prog){
+    const N=path.length;
+    const idxf = clamp(0, N-1, prog*(N-1));
+    let i = Math.floor(idxf);
+    if (i >= N-1) i = N-2;
+    const tt = clamp(0,1, idxf - i);
+    const [x0,y0] = path[i];
+    const [x1,y1] = path[i+1];
+    return {i,tt,x0,y0,x1,y1};
+  }
+  function iFromProgress(p,N){
+    const idxf = clamp(0, N-1, p*(N-1));
+    return Math.floor(Math.min(N-2, idxf));
+  }
+  function mk(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
+  function inset(r,l,t,ri,b){ return {x:r.x+l, y:r.y+t, w:r.w-l-ri, h:r.h-t-b}; }
+  function rr(g,x,y,w,h,r){ g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+  function inside(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(a,b,c){ return Math.max(a, Math.min(b,c)); }
+  function noise1d(x){ const i=Math.floor(x), f=x-i, u=f*f*(3-2*f); return lerp(hash(i), hash(i+1), u); }
+  function hash(n){ return fract(Math.sin(n*127.1)*43758.5453123); }
+  function fract(x){ return x - Math.floor(x); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+})();
+</script>
+</body>
+</html>

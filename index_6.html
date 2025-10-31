@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Laser Etch — Green • Solid Gaussian • Bursts • Curvature-Safe</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{ --bg:#0a0c10; --slab:#0c0d10; --frame:#13151a; }
+  html,body{margin:0;height:100%;background:var(--bg);color:#e9fff5;font:14px/1.25 ui-monospace,Consolas,Menlo,monospace}
+  .wrap{display:grid;place-items:center;min-height:100%}
+  canvas{display:block;width:min(100vw,1280px);height:auto;max-height:92vh;border-radius:12px;box-shadow:0 18px 60px rgba(0,0,0,.45)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c" width="1280" height="720"></canvas>
+</div>
+
+<script>
+(() => {
+  // ===== Setup =====
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // Offscreen layers
+  const art  = mk(W,H), artCtx  = art.getContext('2d');    // background art
+  const slab = mk(W,H), slabCtx = slab.getContext('2d');   // dark slab being cut
+  const glow = mk(W,H), glowCtx = glow.getContext('2d');   // additive glow layer
+  const etch = mk(W,H), etchCtx = etch.getContext('2d');   // solid etched line
+
+  // Params (tweak here)
+  const P = {
+    speed: 0.32,      // ↓ slower laser traversal (was 0.65)
+    kerf: 6,
+    revealLen: 44,
+    revealWidth: 20,
+    powerFloor: 0.42,
+    sparks: 18,
+    // Burst gating (etch…pause…etch…)
+    burstOn:  0.22,   // seconds etching ON
+    burstOff: 0.18    // seconds etching OFF
+  };
+
+  // Colors — GREEN laser palette
+  const COL = {
+    slab: '#0c0d10',
+    frame: '#13151a',
+    laserCore: 'rgb(230,255,245)',   // near-white/green core
+    laserHalo: 'rgb(30,255,170)',    // neon green halo
+    spark:     'rgb(140,255,200)'    // greenish sparks
+  };
+
+  // Layout
+  const rect = { x: Math.floor(W*0.12), y: Math.floor(H*0.18), w: Math.floor(W*0.76), h: Math.floor(H*0.64) };
+  const bbox = inset(rect, rect.w*0.08, rect.h*0.12, rect.w*0.08, rect.h*0.16);
+
+  // Art + slab
+  paintArt(artCtx);
+  slabCtx.fillStyle = COL.slab;
+  rr(slabCtx, rect.x, rect.y, rect.w, rect.h, 12); slabCtx.fill();
+
+  // Motion path: closed Gaussian for beam head
+  const shapeClosed = gaussianClosedPolygon(650, bbox);
+  const pathClosed  = densify(shapeClosed, 2.0);
+  const centroid    = polygonCentroid(shapeClosed);
+
+  // Etch style (solid, glowing)
+  etchCtx.lineCap = 'round';
+  etchCtx.lineJoin = 'round';
+  etchCtx.shadowColor = 'rgba(60,255,180,0.85)';
+  etchCtx.shadowBlur  = 16;
+  etchCtx.strokeStyle = 'rgba(210,255,235,0.95)';
+  etchCtx.lineWidth   = 2.6;
+
+  // Analytic Gaussian mapping y(x) and slope |dy/dx| in screen px
+  const baseline = bbox.y + bbox.h;
+  const GAUSS = {
+    xMin: bbox.x, xMax: bbox.x + bbox.w,
+    yAt(x){
+      const u = (x - bbox.x) / bbox.w;        // 0..1
+      const X = -3 + 6*u;                      // [-3,3]
+      const y = Math.exp(-0.5*X*X);
+      return baseline - y*bbox.h;
+    },
+    absSlopeAt(x){
+      const u = (x - bbox.x) / bbox.w;
+      const X = -3 + 6*u;
+      const y = Math.exp(-0.5*X*X);
+      // dy/dx_screen = d/dX(y)*dX/dx, with y_screen = baseline - y*bbox.h
+      // d(y_screen)/dX = -(dy/dX)*bbox.h; dy/dX = -X*y
+      // => dy/dX_screen = X*y*bbox.h ; dX/dx = 6/bbox.w
+      return Math.abs(X * y * bbox.h * (6 / bbox.w));
+    }
+  };
+
+  // Thresholds
+  const BASE_THRESH2   = 10*10;      // base vertical proximity squared (px^2)
+  const CURVE_GAIN     = 16;         // extra tolerance per unit slope
+  const SUBSAMPLES     = 6;          // multi-sample per frame to avoid gaps
+
+  // Animation state
+  let progress = 0;
+  let last = performance.now();
+  let elapsed = 0;
+  const sparks = [];
+  const gantryY = rect.y - 60;
+  let lastLaser = null;   // {x,y} previous laser head (for subsamples)
+  let lastEtchPt = null;  // {x,y} last etched gaussian point (for solid strokes)
+  requestAnimationFrame(loop);
+
+  // ===== Main loop =====
+  function loop(now){
+    const dt = Math.min(0.05, (now - last)/1000); last = now;
+    elapsed += dt;
+    glowCtx.clearRect(0,0,W,H);
+
+    // Beam flicker
+    const t = now*0.001;
+    const power = clamp(P.powerFloor, 1,
+      0.9 + 0.35*(noise1d(t*11.7)*0.6 + noise1d(t*3.9)*0.4));
+    const widthCore = 1.6 + 0.8*(noise1d(t*7.3)*0.5 + 0.5);
+
+    // Advance along path (slower)
+    progress = Math.min(1, progress + P.speed*dt);
+    const idxf = progress*(pathClosed.length-1);
+    const i = Math.floor(idxf), tt = idxf - i;
+    const [x0,y0] = pathClosed[i], [x1,y1] = pathClosed[(i+1)%pathClosed.length];
+    let lx = x0 + (x1-x0)*tt, ly = y0 + (y1-y0)*tt;
+
+    // tiny jitter
+    lx += (noise1d(t*41.2)-0.5)*1.1;
+    ly += (noise1d(t*37.9)-0.5)*1.1;
+
+    // CUT at head (destination-out)
+    if (inside(lx,ly,rect)){
+      slabCtx.save();
+      slabCtx.globalCompositeOperation = 'destination-out';
+
+      const g = slabCtx.createRadialGradient(lx,ly,0, lx,ly, P.kerf+1.2*noise1d(t*13.3));
+      g.addColorStop(0, `rgba(0,0,0,${(0.28*power).toFixed(3)})`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      slabCtx.fillStyle = g;
+      slabCtx.beginPath(); slabCtx.arc(lx,ly,P.kerf,0,Math.PI*2); slabCtx.fill();
+
+      // reveal wedge (toward centroid)
+      const vx = centroid.x - lx, vy = centroid.y - ly;
+      const m = Math.hypot(vx,vy)||1; const ux = vx/m, uy = vy/m;
+      const nx = -uy, ny = ux;
+      const L = P.revealLen * (0.6 + 0.7*power);
+      const Wedge = P.revealWidth;
+      const p0 = [lx, ly];
+      const p1 = [lx + ux*L + nx*Wedge*0.5, ly + uy*L + ny*Wedge*0.5];
+      const p2 = [lx + ux*L - nx*Wedge*0.5, ly + uy*L - ny*Wedge*0.5];
+      slabCtx.beginPath();
+      slabCtx.moveTo(p0[0], p0[1]);
+      slabCtx.lineTo(p1[0], p1[1]);
+      slabCtx.lineTo(p2[0], p2[1]);
+      slabCtx.closePath();
+      slabCtx.fillStyle = `rgba(0,0,0,${(0.20*power).toFixed(3)})`;
+      slabCtx.fill();
+
+      slabCtx.restore();
+    }
+
+    // Beam (green)
+    const gx = clamp(rect.x-60, rect.x+rect.w+60, lx + 18*Math.sin(now*0.003) + (noise1d(t*23.1)-0.5)*3.2);
+    drawBeam(glowCtx, gx, gantryY, lx, ly, widthCore, power);
+
+    // Sparks
+    const [tx,ty] = tangentAt(pathClosed, i);
+    const nx = -ty, ny = tx;
+    const n = Math.max(0, Math.floor(P.sparks*(0.55 + 0.9*power)/20));
+    for(let k=0;k<n;k++){
+      const sp = rand(180,360)*(0.6+0.8*power);
+      const jn = rand(-140,220);
+      const jx = rand(-50,50), jy = rand(-40,40);
+      sparks.push({x:lx,y:ly,vx:tx*sp+nx*jn+jx,vy:ty*sp+ny*jn+jy,life:1});
+    }
+
+    // ===== Burst gating (etch… pause… etch…)
+    const cycle = P.burstOn + P.burstOff;
+    const phase = elapsed % cycle;
+    const etchOn = (phase < P.burstOn);
+
+    // ===== Curvature-safe, multi-sample etch along the motion this frame
+    // Subsample between last laser position and current to avoid gaps on steep segments
+    const from = lastLaser ?? {x: lx, y: ly};
+    const steps = Math.max(1, SUBSAMPLES);
+    for (let s=1; s<=steps; s++){
+      const fx = lerp(from.x, lx, s/steps);
+      const fy = lerp(from.y, ly, s/steps);
+      if (!etchOn) { lastEtchPt = null; continue; } // pause → break the etched line
+
+      if (fx >= GAUSS.xMin && fx <= GAUSS.xMax){
+        const gy   = GAUSS.yAt(fx);
+        const slope= GAUSS.absSlopeAt(fx);
+        // slope-adaptive tolerance (bigger where curve is steep)
+        const tol2 = BASE_THRESH2 + (CURVE_GAIN * slope) * (CURVE_GAIN * slope);
+        const d2   = (fy-gy)*(fy-gy); // vertical distance since same x
+        if (d2 <= tol2){
+          const cx = fx, cy = gy;
+          etchCtx.beginPath();
+          if (!lastEtchPt || dist2(lastEtchPt.x,lastEtchPt.y,cx,cy) > 900){
+            etchCtx.moveTo(cx, cy);
+          } else {
+            etchCtx.moveTo(lastEtchPt.x, lastEtchPt.y);
+          }
+          etchCtx.lineTo(cx, cy);
+          etchCtx.stroke();
+          lastEtchPt = {x: cx, y: cy};
+        }
+      }
+    }
+    lastLaser = {x: lx, y: ly};
+
+    // Sparks update
+    const keep=[];
+    for(const s of sparks){
+      s.vx *= 0.997; s.vy = s.vy*0.997 + 980*dt;
+      s.x += s.vx*dt; s.y += s.vy*dt;
+      s.life -= dt*rand(0.9,1.4);
+      if(s.life>0 && s.x>=0 && s.x<W && s.y>=0 && s.y<H){
+        keep.push(s);
+        glowCtx.globalCompositeOperation='lighter';
+        glowCtx.fillStyle = rgba(COL.spark, Math.max(0,Math.min(1,s.life)));
+        glowCtx.beginPath(); glowCtx.arc(s.x, s.y, 2, 0, Math.PI*2); glowCtx.fill();
+      }
+    }
+    sparks.length=0; sparks.push(...keep);
+
+    // ===== Compose
+    ctx.drawImage(art, 0, 0);
+    ctx.drawImage(slab, 0, 0);
+    ctx.globalCompositeOperation='screen';
+    ctx.drawImage(etch, 0, 0);      // solid etched curve
+    ctx.globalCompositeOperation='source-over';
+    ctx.strokeStyle = COL.frame; ctx.lineWidth=1.2;
+    rr(ctx, rect.x, rect.y, rect.w, rect.h, 12); ctx.stroke();
+    ctx.globalCompositeOperation='lighter';
+    ctx.drawImage(glow, 0, 0);
+    ctx.globalCompositeOperation='source-over';
+
+    requestAnimationFrame(loop);
+  }
+
+  // ===== Art (placeholder)
+  function paintArt(g){
+    g.clearRect(0,0,W,H);
+    const grad = g.createLinearGradient(0,0,W,H);
+    grad.addColorStop(0,'#102b1e');
+    grad.addColorStop(1,'#3bd6a6');
+    g.fillStyle=grad; g.fillRect(0,0,W,H);
+    g.globalAlpha=0.18; g.strokeStyle='#ffffff'; g.lineWidth=1;
+    for(let x=0;x<=W;x+=40){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,H); g.stroke(); }
+    for(let y=0;y<=H;y+=40){ g.beginPath(); g.moveTo(0,y); g.lineTo(W,y); g.stroke(); }
+    g.globalAlpha=1;
+    g.fillStyle='rgba(235,255,245,0.95)';
+    g.font='bold 46px Consolas, ui-monospace, monospace';
+    g.textAlign='center'; g.textBaseline='middle';
+    g.fillText('Bayesian Modeling & Inference', W/2, H*0.14);
+  }
+
+  // ===== Beam drawing
+  function drawBeam(g, x0,y0,x1,y1, widthCore, power){
+    g.save(); g.globalCompositeOperation='lighter';
+    g.strokeStyle = rgba(COL.laserHalo, 0.35*power);
+    g.lineWidth = widthCore + 6; g.lineCap='round';
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.strokeStyle = rgba(COL.laserCore, Math.max(0.05, power));
+    g.lineWidth = widthCore;
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    softGlow(g, x1, y1, Math.max(6, P.kerf+4), COL.laserHalo, 3, 0.55+0.45*power);
+    g.restore();
+  }
+
+  // ===== Gaussian geometry
+  function gaussianUpperPolyline(samples, box){
+    const xs=[]; for(let i=0;i<samples;i++) xs.push(-3 + 6*(i/(samples-1)));
+    const pts=[]; const baseline=box.y+box.h;
+    for(const x of xs){
+      const y=Math.exp(-0.5*x*x);
+      const sx=box.x + ((x+3)/6)*box.w;
+      const sy=baseline - y*box.h;
+      pts.push([sx,sy]);
+    }
+    return pts;
+  }
+  function gaussianClosedPolygon(samples, box){
+    const upper = gaussianUpperPolyline(samples, box);
+    const pts = upper.slice();
+    const baseline=box.y+box.h;
+    for(let i=upper.length-1;i>=0;i--){
+      const sx=upper[i][0], sy=baseline;
+      pts.push([sx,sy]);
+    }
+    return pts;
+  }
+  function densify(pts, stepPx=2){
+    const out=[];
+    for(let i=0;i<pts.length;i++){
+      const [x0,y0]=pts[i], [x1,y1]=pts[(i+1)%pts.length];
+      const dx=x1-x0, dy=y1-y0, len=Math.hypot(dx,dy);
+      const steps=Math.max(2,Math.floor(len/stepPx));
+      for(let s=0;s<steps;s++){ const t=s/steps; out.push([x0+dx*t, y0+dy*t]); }
+    }
+    return out;
+  }
+  function tangentAt(path,i){
+    const i0=(i-1+path.length)%path.length, i1=(i+1)%path.length;
+    const [x0,y0]=path[i0], [x1,y1]=path[i1];
+    const dx=x1-x0, dy=y1-y0, m=Math.hypot(dx,dy)||1;
+    return [dx/m, dy/m];
+  }
+  function polygonCentroid(pts){
+    let sx=0, sy=0; for(const p of pts){ sx+=p[0]; sy+=p[1]; }
+    return {x:sx/pts.length, y:sy/pts.length};
+  }
+
+  // ===== Utilities
+  function mk(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
+  function inset(r,l,t,ri,b){ return {x:r.x+l, y:r.y+t, w:r.w-l-ri, h:r.h-t-b}; }
+  function rr(g,x,y,w,h,r){ g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+  function inside(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(a,b,c){ return Math.max(a, Math.min(b,c)); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+  function dist2(ax,ay,bx,by){ const dx=ax-bx, dy=ay-by; return dx*dx+dy*dy; }
+  function rgba(rgb, a){ const m=rgb.match(/\d+/g)||[255,255,255]; const [R,G,B]=m.map(Number); return `rgba(${R|0},${G|0},${B|0},${a.toFixed(3)})`; }
+  function softGlow(g,x,y,r,color,layers=3,alpha=0.7){
+    g.save(); g.globalCompositeOperation='lighter';
+    for(let i=0;i<layers;i++){
+      const A=Math.max(0, alpha - i*0.22);
+      g.fillStyle = rgba(color, A);
+      g.beginPath(); g.arc(x,y,r+i*6,0,Math.PI*2); g.fill();
+    }
+    g.restore();
+  }
+  function noise1d(x){ const i=Math.floor(x), f=x-i, u=f*f*(3-2*f); return lerp(hash(i), hash(i+1), u); }
+  function hash(n){ return fract(Math.sin(n*127.1)*43758.5453123); }
+  function fract(x){ return x - Math.floor(x); }
+
+})();
+</script>
+</body>
+</html>

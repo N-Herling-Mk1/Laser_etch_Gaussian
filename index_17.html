@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Laser Etch — Zap Only the Letters</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  html,body{
+    margin:0;height:100%;
+    background:#000;color:#bfffe9;
+    font:14px/1.3 ui-monospace,Consolas,Menlo,monospace;
+  }
+  .wrap{display:grid;place-items:center;min-height:100%}
+  canvas{display:block;width:min(100vw,1280px);height:auto;max-height:92vh}
+  .hud{
+    position:fixed;left:50%;top:12px;transform:translateX(-50%);
+    background:#000a;border:1px solid #0f2;padding:6px 10px;border-radius:8px;
+    color:#bfffe9;font:12px ui-monospace,Consolas,monospace;user-select:none
+  }
+</style>
+</head>
+<body>
+<div class="wrap"><canvas id="c" width="1280" height="720"></canvas></div>
+<div class="hud" id="hud">Laser etching: “hi” (fast, skip blanks)</div>
+
+<script>
+(() => {
+  // ======= Text to etch =======
+  const TEXT = "hi";
+
+  // ======= Canvas & layers =======
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  const under = mk(W,H), uctx = under.getContext('2d'); // bright green underlayer
+  const slab  = mk(W,H), sctx = slab.getContext('2d');  // black slab (we cut holes)
+  const glow  = mk(W,H), gctx = glow.getContext('2d');  // beam + sparks (additive)
+  const etch  = mk(W,H), ectx = etch.getContext('2d');  // faint etched glow line
+
+  const COL = {
+    green: 'rgb(30,255,170)',
+    laserCore: 'rgb(220,255,245)',
+    laserHalo: 'rgb(30,255,170)'
+  };
+
+  // Tunables (FASTER + skip blanks)
+  const P = {
+    kerf: 8,                 // cut radius
+    powerFloor: 0.45,        // min beam visibility
+    rowStep: 10,             // vertical step between scan rows (smaller => denser)
+    cutSpeed: 600,           // px/sec when CUTTING a span (faster)
+    travelSpeed: 1000,       // px/sec when MOVING between spans (no cut)
+    revealLen: 34,           // small molten wedge ahead of beam
+    revealWidth: 16,
+    sparksRateCut: 1400,     // sparks per sec while cutting
+    sparksRateTravel: 200,   // tiny flicker during travel
+    gravity: 980,
+    drag: 0.995
+  };
+
+  // Underlayer & slab
+  uctx.fillStyle = COL.green; uctx.fillRect(0,0,W,H);
+  sctx.fillStyle = '#000';    sctx.fillRect(0,0,W,H);
+
+  // ===== Build centered text mask
+  const mask = mk(W,H), mctx = mask.getContext('2d');
+  const box = drawCenteredWordMask(mctx, TEXT);
+  const img = mctx.getImageData(box.x, box.y, box.w, box.h);
+  const A = img.data; // RGBA array
+
+  // ===== Extract ONLY ink spans per row (skip empty rows and gaps)
+  // Each span: {y, x0, x1, dir} where dir=+1 left->right or -1 right->left
+  const spans = [];
+  let dir = 1;
+  for (let j = 0; j < box.h; j += P.rowStep) {
+    const y = box.y + j;
+    const rowSpans = findSpansInRow(A, box.w, box.h, j);
+    if (rowSpans.length === 0) continue; // skip empty rows entirely
+
+    // Order spans left->right or right->left alternating to reduce head travel
+    if (dir === 1) {
+      for (const [x0, x1] of rowSpans) spans.push({ y, x0: box.x + x0, x1: box.x + x1, dir: +1 });
+    } else {
+      for (let k=rowSpans.length-1; k>=0; k--) {
+        const [x0, x1] = rowSpans[k];
+        spans.push({ y, x0: box.x + x0, x1: box.x + x1, dir: -1 });
+      }
+    }
+    dir *= -1;
+  }
+
+  // ===== Build an execution plan: sequence of waypoints
+  // Waypoint: {type: 'cut'|'travel', x0,y0,x1,y1}
+  const plan = [];
+  let lastX = W/2, lastY = H/2; // start near center
+  for (const s of spans) {
+    const sx = s.dir > 0 ? s.x0 : s.x1;
+    const ex = s.dir > 0 ? s.x1 : s.x0;
+
+    // travel to segment start (no cutting)
+    plan.push({type:'travel', x0:lastX, y0:lastY, x1:sx, y1:s.y});
+    // cut across the span
+    plan.push({type:'cut', x0:sx, y0:s.y, x1:ex, y1:s.y});
+    lastX = ex; lastY = s.y;
+  }
+
+  // Etch style
+  ectx.lineCap='round'; ectx.lineJoin='round';
+  ectx.shadowColor='rgba(60,255,180,0.75)'; ectx.shadowBlur=14;
+  ectx.strokeStyle='rgba(210,255,235,0.9)'; ectx.lineWidth=2.5;
+
+  // Sparks
+  const sparkSprite = makeSparkSprite();
+  const sparks = [];
+  function spawnSparks(x,y,tx,ty,rate,dt){
+    const want = rate * dt;
+    const n = Math.min(50, Math.floor(want + Math.random()));
+    const nx = -ty, ny = tx;
+    for (let i=0;i<n;i++){
+      const vTan = rand(220, 520);
+      const vNrm = rand(-160, 160);
+      const jx = rand(-24,24), jy = rand(-24,24);
+      sparks.push({
+        x, y,
+        vx: tx*vTan + nx*vNrm + jx,
+        vy: ty*vTan + ny*vNrm + jy,
+        life: rand(0.45, 1.0),
+        size: rand(1.0, 2.4)
+      });
+    }
+  }
+  function stepSparks(dt){
+    gctx.save(); gctx.globalCompositeOperation='lighter';
+    const drag = Math.pow(P.drag, dt*60);
+    const kept = [];
+    for (const s of sparks){
+      s.life -= dt; if (s.life <= 0) continue;
+      s.vx *= drag; s.vy = s.vy*drag + P.gravity*dt;
+      s.x += s.vx*dt; s.y += s.vy*dt;
+      if (s.x<-200||s.x>W+200||s.y<-200||s.y>H+300) continue;
+
+      const sp = Math.hypot(s.vx, s.vy);
+      const len = Math.max(8, sp*0.050);
+      const thick = Math.max(2, s.size*2.0);
+      const ang = Math.atan2(s.vy, s.vx);
+
+      gctx.translate(s.x, s.y); gctx.rotate(ang);
+      gctx.globalAlpha = Math.max(0, Math.min(1, s.life));
+      gctx.drawImage(sparkSprite, -len*0.7, -thick*1.2, len*1.4, thick*2.4);
+      gctx.globalAlpha = Math.max(0, Math.min(1, s.life*1.2));
+      gctx.drawImage(sparkSprite, -len*0.5, -thick*0.6, len*1.0, thick*1.2);
+      gctx.setTransform(1,0,0,1,0,0);
+
+      kept.push(s);
+    }
+    sparks.length=0; sparks.push(...kept);
+    gctx.restore();
+  }
+
+  // Underlayer & slab already set
+  let last = performance.now();
+  let stepIdx = 0;
+  let tAlong = 0; // 0..1 within current segment
+  let done = plan.length === 0;
+
+  requestAnimationFrame(loop);
+  function loop(now){
+    const dt = Math.min(0.1, (now - last)/1000); last = now;
+    gctx.clearRect(0,0,W,H);
+
+    const time = now*0.001;
+    const power = clamp(P.powerFloor, 1,
+      0.9 + 0.35*(noise1d(time*11.7)*0.6 + noise1d(time*3.9)*0.4)
+    );
+    const widthCore = 1.9 + 0.9*(noise1d(time*7.3)*0.5 + 0.5);
+
+    let lx, ly, tx = 1, ty = 0, cutting = false;
+
+    if (!done){
+      const seg = plan[stepIdx];
+      const speed = seg.type === 'cut' ? P.cutSpeed : P.travelSpeed;
+
+      // advance tAlong by speed
+      const dx = seg.x1 - seg.x0, dy = seg.y1 - seg.y0;
+      const L = Math.max(1e-4, Math.hypot(dx,dy));
+      const dtNorm = (speed * dt) / L;
+      tAlong = Math.min(1, tAlong + dtNorm);
+
+      lx = seg.x0 + dx * tAlong;
+      ly = seg.y0 + dy * tAlong;
+      tx = dx / L; ty = dy / L;
+      cutting = (seg.type === 'cut');
+
+      // Draw beam
+      drawBeam(gctx, lx - 60*tx, ly - 60*ty - 80, lx, ly, widthCore, power);
+
+      if (cutting){
+        // Only cut near text (robust circle hit; most of the time we are on-mask already)
+        if (hitMaskCircle(lx, ly, P.kerf+2, box, A)){
+          cutAt(sctx, lx, ly, tx, ty, power);
+          // etch glow dot
+          ectx.beginPath(); ectx.moveTo(lx, ly); ectx.lineTo(lx+0.01, ly+0.01); ectx.stroke();
+          spawnSparks(lx, ly, tx, ty, P.sparksRateCut*(0.7+0.6*power), dt);
+        }
+      } else {
+        // light travel sparks
+        spawnSparks(lx, ly, tx, ty, P.sparksRateTravel, dt);
+      }
+
+      if (tAlong >= 1 - 1e-6){
+        stepIdx++;
+        tAlong = 0;
+        if (stepIdx >= plan.length) done = true;
+      }
+    } else {
+      // idle beam glow at center
+      lx = W/2; ly = H*0.65;
+      drawBeam(gctx, lx-40, ly-100, lx, ly, widthCore*0.8, P.powerFloor);
+    }
+
+    // Sparks physics/draw
+    stepSparks(dt);
+
+    // Compose
+    ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H);
+    ctx.drawImage(under,0,0);
+    ctx.drawImage(slab,0,0);
+    ctx.globalCompositeOperation='screen';  ctx.drawImage(etch,0,0);
+    ctx.globalCompositeOperation='lighter'; ctx.drawImage(glow,0,0);
+    ctx.globalCompositeOperation='source-over';
+
+    requestAnimationFrame(loop);
+  }
+
+  // ===== Helpers =====
+
+  function drawCenteredWordMask(g, word){
+    g.clearRect(0,0,W,H);
+    // Fit ~60% of canvas width
+    const targetW = W * 0.6;
+    let fontSize = 220;
+    g.font = `800 ${fontSize}px Consolas, ui-monospace, monospace`;
+    let w = g.measureText(word).width;
+    fontSize = Math.max(36, Math.floor(fontSize * (targetW / w)));
+    g.font = `800 ${fontSize}px Consolas, ui-monospace, monospace`;
+
+    g.textAlign='center'; g.textBaseline='middle';
+    const cx = W/2, cy = H/2;
+
+    // draw opaque white to mask
+    g.fillStyle = '#fff';
+    g.fillText(word, cx, cy);
+
+    const pad = Math.max(8, Math.floor(fontSize*0.08));
+    const width = Math.ceil(g.measureText(word).width);
+    const box = {
+      x: Math.floor(cx - width/2) - pad,
+      y: Math.floor(cy - fontSize*0.6) - pad,
+      w: width + pad*2,
+      h: Math.floor(fontSize*1.2) + pad*2
+    };
+    return box;
+  }
+
+  // scan a row of the alpha image (within bounding box coords) to find contiguous ink spans
+  function findSpansInRow(A, w, h, rowY){
+    const spans = [];
+    const thr = 8; // alpha threshold
+    let inSpan = false, start = 0;
+
+    for (let x = 0; x < w; x++){
+      const idx = (rowY * w + x) * 4 + 3; // alpha channel
+      const on = A[idx] > thr;
+      if (on && !inSpan){ inSpan = true; start = x; }
+      else if (!on && inSpan){ inSpan = false; spans.push([start, x-1]); }
+    }
+    if (inSpan) spans.push([start, w-1]);
+    return spans;
+  }
+
+  function hitMaskCircle(x, y, radius, box, A){
+    const cx = Math.floor(x) - box.x;
+    const cy = Math.floor(y) - box.y;
+    if (sample(cx,cy)) return true;
+    const R = Math.max(1, Math.floor(radius));
+    const dirs = 12;
+    for (let k=0;k<dirs;k++){
+      const a = (k*Math.PI*2)/dirs;
+      const sx = Math.round(cx + Math.cos(a)*R);
+      const sy = Math.round(cy + Math.sin(a)*R);
+      if (sample(sx,sy)) return true;
+    }
+    return false;
+
+    function sample(px,py){
+      if (px<0 || py<0 || px>=box.w || py>=box.h) return false;
+      const idx = (py*box.w + px)*4 + 3;
+      return A[idx] > 8;
+    }
+  }
+
+  // Cutting op at (lx,ly) with wedge oriented by tangent (tx,ty)
+  function cutAt(g, lx, ly, tx, ty, power){
+    g.save();
+    g.globalCompositeOperation='destination-out';
+
+    const k = P.kerf;
+    const rg = g.createRadialGradient(lx,ly,0,lx,ly,k+1.0);
+    rg.addColorStop(0,`rgba(0,0,0,${(0.32*power).toFixed(3)})`);
+    rg.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle = rg;
+    g.beginPath(); g.arc(lx,ly,k,0,Math.PI*2); g.fill();
+
+    const nx = -ty, ny = tx;
+    const L = P.revealLen * (0.8 + 0.5*power);
+    const Wd = P.revealWidth;
+    g.beginPath();
+    g.moveTo(lx, ly);
+    g.lineTo(lx + tx*L + nx*(Wd*0.5), ly + ty*L + ny*(Wd*0.5));
+    g.lineTo(lx + tx*L - nx*(Wd*0.5), ly + ty*L - ny*(Wd*0.5));
+    g.closePath();
+    g.fillStyle = `rgba(0,0,0,${(0.18*power).toFixed(3)})`;
+    g.fill();
+
+    g.restore();
+  }
+
+  // Beam renderer with flicker
+  function drawBeam(g, x0,y0,x1,y1, widthCore, power){
+    g.save(); g.globalCompositeOperation='lighter';
+    g.strokeStyle = withAlpha(COL.laserHalo, 0.35*power);
+    g.lineWidth = widthCore + 6;
+    g.lineCap = 'round';
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+
+    g.strokeStyle = withAlpha(COL.laserCore, Math.max(0.06, power));
+    g.lineWidth = widthCore;
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+
+    g.fillStyle = withAlpha(COL.laserHalo, 0.65);
+    for (let r=6;r<=18;r+=6){ g.beginPath(); g.arc(x1,y1,r,0,Math.PI*2); g.fill(); }
+    g.restore();
+  }
+
+  // Utils
+  function mk(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(a,b,c){ return Math.max(a, Math.min(b,c)); }
+  function withAlpha(rgb, a){
+    if (rgb.startsWith('rgba')) {
+      return rgb.replace(/rgba\(([^)]+)\)/, (_, inner) => {
+        const parts = inner.split(',').map(s=>s.trim());
+        return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${a.toFixed(3)})`;
+      });
+    }
+    return rgb.replace('rgb(','rgba(').replace(')',','+a.toFixed(3)+')');
+  }
+  function noise1d(x){ const i=Math.floor(x), f=x-i, u=f*f*(3-2*f); return lerp(hash(i), hash(i+1), u); }
+  function hash(n){ return fract(Math.sin(n*127.1)*43758.5453123); }
+  function fract(x){ return x - Math.floor(x); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+  function makeSparkSprite(){
+    const S=96, cv=document.createElement('canvas'); cv.width=cv.height=S;
+    const c=cv.getContext('2d');
+    const g=c.createRadialGradient(S/2,S/2,1, S/2,S/2,S/2);
+    g.addColorStop(0,'rgba(255,255,255,1.0)');
+    g.addColorStop(0.15,'rgba(230,255,245,0.95)');
+    g.addColorStop(0.40,'rgba(120,255,200,0.55)');
+    g.addColorStop(1,'rgba(120,255,200,0.0)');
+    c.fillStyle=g; c.beginPath(); c.arc(S/2,S/2,S/2,0,Math.PI*2); c.fill();
+    return cv;
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Laser Etch — Gaussian + Text (delayed glow, merging beams)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root {
+      --bg: #000;
+      --slab: #0c0d10;
+      --frame: #13151a;
+    }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: #e9fff5;
+      font: 14px/1.25 ui-monospace, Consolas, Menlo, monospace;
+    }
+    .wrap {
+      display: grid;
+      place-items: center;
+      min-height: 100%;
+    }
+    canvas {
+      display: block;
+      width: min(100vw, 1280px);
+      height: auto;
+      max-height: 92vh;
+      border-radius: 12px;
+      box-shadow: 0 18px 60px rgba(0,0,0,.55);
+    }
+    .hud{
+      position:fixed;
+      left:50%;
+      top:10px;
+      transform:translateX(-50%);
+      background:rgba(0,0,0,.45);
+      border:1px solid rgba(255,255,255,.08);
+      padding:6px 10px;
+      border-radius:8px;
+      color:#bfffe9;
+      font:13px Consolas,monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="c" width="1280" height="720"></canvas>
+  </div>
+  <div class="hud" id="hud">Phase: 1/3 — Etching Gaussian</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const hud = document.getElementById("hud");
+
+  // layers
+  const bg        = mk(W,H), bgCtx        = bg.getContext("2d");
+  const slab      = mk(W,H), slabCtx      = slab.getContext("2d");
+  const glow      = mk(W,H), glowCtx      = glow.getContext("2d");
+  const etchCurve = mk(W,H), etchCurveCtx = etchCurve.getContext("2d");
+  const liveCurve = mk(W,H), liveCurveCtx = liveCurve.getContext("2d");
+  const etchText  = mk(W,H), etchTextCtx  = etchText.getContext("2d");
+  const liveText  = mk(W,H), liveTextCtx  = liveText.getContext("2d");
+
+  // bg
+  bgCtx.fillStyle = "#000";
+  bgCtx.fillRect(0,0,W,H);
+
+  // layout
+  const rect = { x:Math.floor(W*0.12), y:Math.floor(H*0.18), w:Math.floor(W*0.76), h:Math.floor(H*0.64) };
+  const bbox = inset(rect, Math.floor(rect.w*0.08), Math.floor(rect.h*0.12), Math.floor(rect.w*0.08), Math.floor(rect.h*0.16));
+  const baseY = bbox.y + bbox.h;
+  const gantryY = rect.y - 60;
+
+  // slab
+  slabCtx.fillStyle = "#0c0d10";
+  rr(slabCtx, rect.x, rect.y, rect.w, rect.h, 12); slabCtx.fill();
+
+  // gaussian path
+  const upper = gaussianUpperPolyline(620, bbox);
+  const upperPath = densify(upper, 2);
+  const basePts = [];
+  for (let i=upperPath.length-1;i>=0;i--) basePts.push([upperPath[i][0], baseY]);
+  const baselinePath = densify(basePts, 3);
+  const closed = upperPath.concat(baselinePath);
+  const U = upperPath.length;
+  const N = closed.length;
+  const gaussianEnd = closed[N-1]; // final corner to park on
+  const centroid = polygonCentroid(closed);
+
+  // curve style
+  etchCurveCtx.lineCap     = "round";
+  etchCurveCtx.lineJoin    = "round";
+  etchCurveCtx.strokeStyle = "rgba(140,255,210,1)";
+  etchCurveCtx.shadowColor = "rgba(60,255,180,0.8)";
+  etchCurveCtx.shadowBlur  = 16;
+  etchCurveCtx.lineWidth   = 3;
+
+  // sparks
+  const SP = {
+    MAX: 2000,
+    EMIT_RATE: 1600,
+    SIZE: [1.0, 3.2],
+    TRAIL: 0.055,
+    GRAV: 980,
+    DRAG: 0.995,
+    LIFE: [0.6, 1.4],
+    VT: [240,520],
+    VN: [-220,220],
+    JIT: [-35,35],
+    BOUNCE: 0.35,
+  };
+  const sparkSprite = makeSparkSprite();
+  const sparks = new Array(SP.MAX);
+  let sparkCount = 0;
+
+  // text
+  const L1 = "INFO 510";
+  const L2 = "Bayesian Modelling and Inference";
+  const textMask = mk(W,H), textMaskCtx = textMask.getContext("2d");
+  const sweepTmp = mk(W,H), sweepCtx = sweepTmp.getContext("2d");
+  const textCut  = mk(W,H), textCutCtx  = textCut.getContext("2d");
+  const fontL1 = "bold 50px Consolas,ui-monospace,monospace";
+  const fontL2 = "bold 46px Consolas,ui-monospace,monospace";
+
+  // center text horizontally
+  const tx = rect.x + rect.w/2;
+  const raiseFactor = 0.16;
+  textMaskCtx.textAlign = "center";
+  textMaskCtx.textBaseline = "middle";
+  textMaskCtx.font = fontL1; const tw1 = textMaskCtx.measureText(L1).width;
+  textMaskCtx.font = fontL2; const tw2 = textMaskCtx.measureText(L2).width;
+  const tw = Math.max(tw1, tw2);
+  const tyRaise  = Math.round(bbox.h * raiseFactor);
+  const tyCenter = Math.round(clamp(bbox.y+60, bbox.y+bbox.h-60, centroid.y - tyRaise));
+  const lineGap  = 56;
+  const y1 = tyCenter - lineGap/2;
+  const y2 = tyCenter + lineGap/2;
+  textMaskCtx.fillStyle = "#fff";
+  textMaskCtx.shadowColor = "rgba(60,255,180,0.8)";
+  textMaskCtx.shadowBlur = 7;
+  textMaskCtx.font = fontL1; textMaskCtx.fillText(L1, tx, y1);
+  textMaskCtx.font = fontL2; textMaskCtx.fillText(L2, tx, y2);
+  const textAlphaData = textMaskCtx.getImageData(0,0,W,H).data;
+
+  // persistent text canvas — we keep the bright version here
+  etchTextCtx.lineCap     = "round";
+  etchTextCtx.lineJoin    = "round";
+  etchTextCtx.shadowColor = "rgba(60,255,180,0.65)";
+  etchTextCtx.shadowBlur  = 12;
+
+  // state
+  const PHASE = { CURVE:0, TEXT:1, DONE:2 };
+  let phase = PHASE.CURVE;
+  let last  = performance.now();
+  let progress = 0;
+  let lastUpper = null, lastBase = null;
+
+  // text sweep + delayed fade
+  const TEXT_PASSES = 2;
+  const marginText = 80;
+  const startX = tx - 0.5*tw - marginText;
+  const endX   = tx + 0.5*tw + marginText;
+  const sweep = { x:startX, dir:1, speed:420, width:80, falloff:70, passCount:0 };
+
+  let textDoneAt = null;
+  const TEXT_FADE_DELAY = 0.5;
+  const TEXT_FADE_DUR   = 1.0;
+
+  // multi-beams with merge
+  const mergeTarget = { x: gaussianEnd[0], y: rect.y - 100 }; // vertical above corner
+  const beamSources = [
+    {
+      baseX: W/2,
+      baseY: rect.y - 80,
+      phase: 0.0,
+      flick: 1.6,
+      amp: 1.0,
+      mergeProgress: 0
+    },
+    {
+      baseX: rect.x - 80,
+      baseY: rect.y - 50,
+      phase: 0.5,
+      flick: 2.5,
+      amp: 0.95,
+      mergeProgress: 0
+    },
+    {
+      baseX: rect.x+rect.w+80,
+      baseY: rect.y - 40,
+      phase: 1.0,
+      flick: 1.2,
+      amp: 0.9,
+      mergeProgress: 0
+    }
+  ];
+  const MERGE_SPEED = 0.7; // seconds-ish to merge
+
+  hudUpdate();
+  requestAnimationFrame(loop);
+
+  function loop(now){
+    const dt = Math.min((now - last)/1000, 0.1);
+    last = now;
+
+    glowCtx.clearRect(0,0,W,H);
+    liveCurveCtx.clearRect(0,0,W,H);
+    liveTextCtx.clearRect(0,0,W,H);
+
+    const t = now*0.001;
+    const basePower = clamp(0.35, 1, 0.9 + 0.35*(noise1d(t*11.7)*0.6 + noise1d(t*3.9)*0.4));
+    const widthCore = 1.4 + 0.8*(noise1d(t*7.3)*0.5 + 0.5);
+
+    if (phase === PHASE.CURVE){
+      progress += 0.28 * dt;
+      if (progress >= 1){
+        progress = 1;
+        phase = PHASE.TEXT;
+        hudUpdate();
+      }
+
+      const {i,tt,x0,y0,x1,y1} = segAt(closed, progress);
+      const lx = x0 + (x1 - x0)*tt;
+      const ly = y0 + (y1 - y0)*tt;
+      const [txv,tyv] = tangentAt(closed, i);
+
+      // draw beams (still from their own sources)
+      for (const src of beamSources){
+        const pwr = flickerPower(basePower, t, src.phase, src.flick ?? 1.5, src.amp ?? 0.9);
+        const sx = src.baseX;
+        const sy = src.baseY;
+        drawBeam(glowCtx, sx, sy, lx, ly, widthCore, pwr);
+      }
+
+      emitSparks(lx, ly, txv, tyv, basePower, 1.0, dt);
+
+      if (inside(lx,ly,rect)){
+        carveSlab(slabCtx, lx, ly, centroid, basePower);
+      }
+
+      traceCurve(etchCurveCtx, closed, U, N, iFromProgress(progress,N), tt, lastUpper, lastBase);
+      lastUpper = window._lastUpper;
+      lastBase  = window._lastBase;
+
+      drawLiveCircle(liveCurveCtx, lx, ly, "rgba(160,255,210,0.95)", 20);
+
+    } else if (phase === PHASE.TEXT) {
+      sweep.x += sweep.dir * sweep.speed * dt;
+      if (sweep.dir > 0 && sweep.x > endX){ sweep.x = endX; sweep.dir = -1; sweep.passCount++; }
+      else if (sweep.dir < 0 && sweep.x < startX){ sweep.x = startX; sweep.dir = 1; sweep.passCount++; }
+
+      const lx = clamp(startX, endX, sweep.x + 0.5*sweep.width);
+      const ly = Math.round((y1+y2)/2);
+      const isSecondPass = (sweep.passCount >= 1 && sweep.dir === -1);
+
+      // build sweep for text
+      sweepCtx.clearRect(0,0,W,H);
+      const grad = sweepCtx.createLinearGradient(sweep.x - sweep.falloff, 0, sweep.x + sweep.width + sweep.falloff, 0);
+      grad.addColorStop(0, "rgba(255,255,255,0)");
+      grad.addColorStop(0.5, "rgba(255,255,255,1)");
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      sweepCtx.fillStyle = grad;
+      sweepCtx.fillRect(sweep.x - sweep.falloff, 0, sweep.width + 2*sweep.falloff, H);
+
+      // intersect
+      textCutCtx.clearRect(0,0,W,H);
+      textCutCtx.globalCompositeOperation='source-over';
+      textCutCtx.drawImage(textMask,0,0);
+      textCutCtx.globalCompositeOperation='destination-in';
+      textCutCtx.drawImage(sweepTmp,0,0);
+
+      // draw beams (still separate sources)
+      for (const src of beamSources){
+        const pwr = flickerPower(basePower, t, src.phase, src.flick ?? 1.5, src.amp ?? 0.9);
+        drawBeam(glowCtx, src.baseX, src.baseY, lx, ly, widthCore, pwr);
+      }
+
+      emitSparks(lx, ly, sweep.dir, 0, basePower, 1.0, dt);
+
+      // carve at text head
+      carveSlab(slabCtx, lx, ly, {x:lx,y:ly}, basePower*0.8, 5);
+
+      // live green slice
+      drawLiveMask(liveTextCtx, textCut, isSecondPass ? "rgba(170,255,220,1)" : "rgba(150,255,205,1)", 18);
+
+      // store bright text into etchTextCtx (this is the “final” look)
+      etchTextCtx.save();
+      etchTextCtx.globalCompositeOperation='source-over';
+      etchTextCtx.drawImage(textCut,0,0);
+      etchTextCtx.globalCompositeOperation='source-in';
+      etchTextCtx.fillStyle = "rgba(140,255,210,1)";
+      etchTextCtx.fillRect(0,0,W,H);
+      etchTextCtx.restore();
+
+      if (sweep.passCount >= TEXT_PASSES){
+        textDoneAt = now/1000.0;
+        phase = PHASE.DONE;
+        hudUpdate();
+      }
+
+    } else {
+      // DONE — beams MERGE slowly into one vertical beam
+      for (const src of beamSources){
+        src.mergeProgress = Math.min(1, src.mergeProgress + MERGE_SPEED*dt);
+        const sx = lerp(src.baseX, mergeTarget.x, src.mergeProgress);
+        const sy = lerp(src.baseY, mergeTarget.y, src.mergeProgress);
+        const pwr = 0.6 + 0.35*(0.5 + 0.5*Math.sin(t*9.0 + src.phase));
+        drawBeam(glowCtx, sx, sy, gaussianEnd[0], gaussianEnd[1], 2.0, pwr);
+      }
+      emitSparks(gaussianEnd[0], gaussianEnd[1], 0,1, 0.55, 0.5, dt);
+    }
+
+    // delayed text alpha (global)
+    const nowSec = now/1000.0;
+    const textAlpha = delayedAlpha(textDoneAt, nowSec, TEXT_FADE_DELAY, TEXT_FADE_DUR);
+
+    composeFrame(textAlpha);
+    requestAnimationFrame(loop);
+  }
+
+  function composeFrame(textA){
+    ctx.drawImage(bg,0,0);
+    ctx.drawImage(slab,0,0);
+
+    // gaussian is fully visible where cut
+    ctx.globalCompositeOperation='screen';
+    ctx.globalAlpha = 1;
+    ctx.drawImage(etchCurve,0,0);
+
+    // TEXT: after cut is finished, we want FULL TEXT to appear, not just band
+    // so we multiply the whole mask by textA:
+    if (textA > 0){
+      // make a temp to colorize the textMask
+      const tmp = mk(W,H), tmpCtx = tmp.getContext('2d');
+      tmpCtx.drawImage(textMask,0,0);
+      tmpCtx.globalCompositeOperation='source-in';
+      tmpCtx.fillStyle = "rgba(140,255,210,1)";
+      tmpCtx.fillRect(0,0,W,H);
+      ctx.globalAlpha = textA;
+      ctx.drawImage(tmp,0,0);
+      ctx.globalAlpha = 1;
+    }
+
+    // live overlays
+    ctx.globalCompositeOperation='lighter';
+    ctx.drawImage(liveCurve,0,0);
+    ctx.drawImage(liveText,0,0);
+
+    // laser + sparks
+    ctx.drawImage(glow,0,0);
+
+    // frame
+    ctx.globalCompositeOperation='source-over';
+    ctx.strokeStyle = "#13151a";
+    ctx.lineWidth = 1.2;
+    rr(ctx, rect.x, rect.y, rect.w, rect.h, 12); ctx.stroke();
+  }
+
+  function hudUpdate(){
+    hud.textContent =
+      (phase===0) ? "Phase: 1/3 — Etching Gaussian"
+    : (phase===1) ? "Phase: 2/3 — Etching Text (delayed glow)"
+    : "Phase: 3/3 — Beams merging";
+  }
+
+  // ------------------------------------------------------------
+  // helpers
+  // ------------------------------------------------------------
+  function carveSlab(g, lx, ly, centroid, power, kerf=6){
+    g.save();
+    g.globalCompositeOperation='destination-out';
+    const rad = kerf + 1.0;
+    const grad = g.createRadialGradient(lx,ly,0,lx,ly,rad);
+    grad.addColorStop(0,`rgba(0,0,0,${(0.35*power).toFixed(3)})`);
+    grad.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle=grad;
+    g.beginPath(); g.arc(lx,ly,kerf,0,Math.PI*2); g.fill();
+
+    // wedge
+    const vx = centroid.x - lx, vy = centroid.y - ly;
+    const m = Math.hypot(vx,vy)||1;
+    const ux = vx/m, uy = vy/m;
+    const wx = -uy, wy = ux;
+    const L = 40*(0.6+0.5*power);
+    const Wd = 20;
+    g.beginPath();
+    g.moveTo(lx,ly);
+    g.lineTo(lx+ux*L+wx*(Wd*0.5), ly+uy*L+wy*(Wd*0.5));
+    g.lineTo(lx+ux*L-wx*(Wd*0.5), ly+uy*L-wy*(Wd*0.5));
+    g.closePath();
+    g.fillStyle = `rgba(0,0,0,${(0.22*power).toFixed(3)})`;
+    g.fill();
+    g.restore();
+  }
+
+  function traceCurve(g, closed, U, N, i, tt, lastU, lastB){
+    const STEPS = 10;
+    const idxf = i + tt;
+    for (let s=0;s<=STEPS;s++){
+      const k = clamp(0, N-1-1e-4, idxf - (STEPS-s)*0.25);
+      const ki = Math.floor(k);
+      const kt = k - ki;
+      const [ax,ay] = closed[ki];
+      const [bx,by] = closed[ki+1] ?? closed[ki];
+      const sx = ax + (bx-ax)*kt;
+      const sy = ay + (by-ay)*kt;
+
+      g.beginPath();
+      if (ki < U-1){
+        if (lastU==null || ki<lastU || ki-lastU>50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastU]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastU=ki; lastB=null;
+      } else {
+        if (lastB==null || ki<lastB || ki-lastB>50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastB]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastB=ki; lastU=null;
+      }
+    }
+    window._lastUpper = lastU;
+    window._lastBase  = lastB;
+  }
+
+  function drawLiveCircle(g, x,y, color, r){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    const gg = g.createRadialGradient(x,y,0,x,y,r);
+    gg.addColorStop(0, color);
+    gg.addColorStop(1, "rgba(0,0,0,0)");
+    g.fillStyle = gg;
+    g.beginPath();
+    g.arc(x,y,r,0,Math.PI*2);
+    g.fill();
+    g.restore();
+  }
+
+  function drawLiveMask(target, mask, color, blur=18){
+    target.save();
+    target.globalCompositeOperation='source-over';
+    target.drawImage(mask,0,0);
+    target.globalCompositeOperation='source-in';
+    target.fillStyle = color;
+    target.shadowColor = 'rgba(60,255,180,0.9)';
+    target.shadowBlur  = blur;
+    target.fillRect(0,0,canvas.width,canvas.height);
+    target.restore();
+  }
+
+  function delayedAlpha(doneAt, nowSec, delay, dur){
+    if (doneAt == null) return 0;
+    const dt = nowSec - doneAt;
+    if (dt < delay) return 0;
+    const p = (dt - delay)/dur;
+    return p < 0 ? 0 : p > 1 ? 1 : p;
+  }
+
+  function flickerPower(base, t, phase, freq, amp){
+    const slow  = 0.5 + 0.5*Math.sin(2*Math.PI*(t*freq + phase));
+    const fast  = 0.25 + 0.75*(0.5 + 0.5*Math.sin(2*Math.PI*(t*freq*3.3 + phase*2.0)));
+    const noise = 0.25*(noise1d(t*freq*1.1 + phase*9.1) - 0.5);
+    return clamp(0.25, 1.05, base*(1-amp) + base*amp*slow + fast*0.25 + noise);
+  }
+
+  // math / utils
+  function gaussianUpperPolyline(samples, box){
+    const pts=[];
+    for (let i=0;i<samples;i++){
+      const x=-3+6*(i/(samples-1)), y=Math.exp(-0.5*x*x);
+      const sx=box.x+((x+3)/6)*box.w;
+      const sy=box.y+box.h - y*box.h;
+      pts.push([sx,sy]);
+    }
+    return pts;
+  }
+  function densify(pts, step=2){
+    const out=[];
+    for (let i=0;i<pts.length-1;i++){
+      const [x0,y0]=pts[i], [x1,y1]=pts[i+1];
+      const dx=x1-x0, dy=y1-y0, len=Math.hypot(dx,dy);
+      const n=Math.max(1,Math.floor(len/step));
+      for (let s=0;s<n;s++){ const t=s/n; out.push([x0+dx*t, y0+dy*t]); }
+    }
+    out.push(pts.at(-1));
+    return out;
+  }
+  function polygonCentroid(pts){ let sx=0,sy=0; for(const p of pts){ sx+=p[0]; sy+=p[1]; } return {x:sx/pts.length,y:sy/pts.length}; }
+  function tangentAt(path,i){
+    const N=path.length;
+    const i0=Math.max(0, Math.min(N-1, i-1));
+    const i1=Math.max(0, Math.min(N-1, i+1));
+    const [x0,y0]=path[i0], [x1,y1]=path[i1];
+    const dx=x1-x0, dy=y1-y0, m=Math.hypot(dx,dy)||1;
+    return [dx/m, dy/m];
+  }
+  function segAt(path, prog){
+    const N=path.length;
+    const idxf = clamp(0, N-1, prog*(N-1));
+    let i = Math.floor(idxf);
+    if (i >= N-1) i = N-2;
+    const tt = clamp(0,1, idxf - i);
+    const [x0,y0] = path[i], [x1,y1] = path[i+1];
+    return {i,tt,x0,y0,x1,y1};
+  }
+  function iFromProgress(p,N){
+    const idxf = clamp(0, N-1, p*(N-1));
+    return Math.floor(Math.min(N-2, idxf));
+  }
+  function mk(w,h){ const c=document.createElement("canvas"); c.width=w; c.height=h; return c; }
+  function inset(r,l,t,ri,b){ return {x:r.x+l,y:r.y+t,w:r.w-l-ri,h:r.h-t-b}; }
+  function rr(g,x,y,w,h,r){ g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+  function inside(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+  function clamp(a,b,c){ return Math.max(a, Math.min(b,c)); }
+  function noise1d(x){ const i=Math.floor(x), f=x-i, u=f*f*(3-2*f); return lerp(hash(i), hash(i+1), u); }
+  function hash(n){ return fract(Math.sin(n*127.1)*43758.5453123); }
+  function fract(x){ return x - Math.floor(x); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+  function makeSparkSprite(){
+    const S=92, cv=document.createElement("canvas"); cv.width=cv.height=S;
+    const c=cv.getContext("2d");
+    const g=c.createRadialGradient(S/2,S/2,1,S/2,S/2,S/2);
+    g.addColorStop(0,'rgba(255,255,255,1)');
+    g.addColorStop(0.18,'rgba(230,255,245,0.96)');
+    g.addColorStop(0.5,'rgba(140,255,210,0.55)');
+    g.addColorStop(1,'rgba(140,255,210,0)');
+    c.fillStyle=g; c.beginPath(); c.arc(S/2,S/2,S/2,0,Math.PI*2); c.fill();
+    return cv;
+  }
+  function emitSparks(lx,ly,tx,ty,power,emit,dt){
+    const nx=-ty, ny=tx;
+    const want = SP.EMIT_RATE * power * dt * emit;
+    const count = Math.min(Math.floor(want + Math.random()), SP.MAX - sparkCount);
+    for (let i=0;i<count;i++){
+      const vT= rand(SP.VT[0], SP.VT[1]);
+      const vN= rand(SP.VN[0], SP.VN[1]);
+      const jx= rand(SP.JIT[0],SP.JIT[1]);
+      const jy= rand(SP.JIT[0],SP.JIT[1]);
+      const vx= tx*vT + nx*vN + jx;
+      const vy= ty*vT + ny*vN + jy;
+      const life= rand(SP.LIFE[0], SP.LIFE[1]);
+      const size= rand(SP.SIZE[0], SP.SIZE[1]);
+      newSpark(lx,ly,vx,vy,life,size);
+    }
+    renderSparks(glowCtx, dt);
+  }
+  function renderSparks(g,dt){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    const drag = Math.pow(SP.DRAG, dt*60);
+    const top  = rect.y;
+    let write=0;
+    for (let i=0;i<sparkCount;i++){
+      const s = sparks[i];
+      s.life -= dt;
+      if (s.life <= 0) continue;
+      s.vx *= drag;
+      s.vy  = s.vy*drag + SP.GRAV*dt;
+      s.x  += s.vx*dt;
+      s.y  += s.vy*dt;
+      if (s.y>=top && s.y<=top+2 && s.vy>0 && s.x>=rect.x && s.x<=rect.x+rect.w){
+        s.y=top-0.1; s.vy *= -SP.BOUNCE; s.vx *= 0.9;
+      }
+      if (s.x<-200 || s.x>W+200 || s.y<-200 || s.y>H+300) continue;
+      const spd = Math.hypot(s.vx,s.vy);
+      const len = Math.max(8, spd*SP.TRAIL);
+      const th  = Math.max(2, s.size*2);
+      const ang = Math.atan2(s.vy,s.vx);
+      g.translate(s.x,s.y); g.rotate(ang);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life));
+      g.drawImage(sparkSprite, -len*0.7, -th*1.0, len*1.4, th*2.0);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life*1.1));
+      g.drawImage(sparkSprite, -len*0.4, -th*0.5, len*0.8, th);
+      g.setTransform(1,0,0,1,0,0);
+      sparks[write++] = s;
+    }
+    sparkCount = write;
+    g.restore();
+  }
+  function newSpark(x,y,vx,vy,life,size){
+    if (sparkCount >= SP.MAX) return;
+    sparks[sparkCount++] = {x,y,vx,vy,life,size};
+  }
+  function drawBeam(g,x0,y0,x1,y1,w,p){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    g.strokeStyle = `rgba(30,255,170,${(0.45*p).toFixed(3)})`;
+    g.lineWidth = w+6; g.lineCap='round';
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.strokeStyle = `rgba(230,255,245,${(Math.max(0.05,p)).toFixed(3)})`;
+    g.lineWidth = w;
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.fillStyle = `rgba(30,255,170,0.65)`;
+    for (let i=0;i<3;i++){ g.beginPath(); g.arc(x1,y1,6+i*6,0,Math.PI*2); g.fill(); }
+    g.restore();
+  }
+  function rand(a,b){ return a + Math.random()*(b-a); }
+
+})();
+</script>
+</body>
+</html>

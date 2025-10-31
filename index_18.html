@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Laser Etch — Gaussian + Two-Line Text (Pass-2 Live Promotion + Jitter)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{ --bg:#0a0c10; --slab:#0c0d10; --frame:#13151a; }
+  html,body{margin:0;height:100%;background:var(--bg);color:#e9fff5;font:14px/1.25 ui-monospace,Consolas,Menlo,monospace}
+  .wrap{display:grid;place-items:center;min-height:100%}
+  canvas{display:block;width:min(100vw,1280px);height:auto;max-height:92vh;border-radius:12px;box-shadow:0 18px 60px rgba(0,0,0,.45)}
+  .hud{position:fixed;left:50%;top:10px;transform:translateX(-50%);
+       background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
+       padding:6px 10px;border-radius:8px;color:#bfffe9;font:13px Consolas,monospace;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c" width="1280" height="720"></canvas>
+</div>
+<div class="hud" id="hud">Phase: Curve+Baseline</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const hud = document.getElementById('hud');
+
+  // Layers
+  const art       = mk(W,H), artCtx       = art.getContext('2d');
+  const slab      = mk(W,H), slabCtx      = slab.getContext('2d');
+  const glow      = mk(W,H), glowCtx      = glow.getContext('2d');      // laser + sparks
+  const etchCurve = mk(W,H), etchCurveCtx = etchCurve.getContext('2d'); // Gaussian + baseline
+  const etchText  = mk(W,H), etchTextCtx  = etchText.getContext('2d');  // Persistent text (neon)
+  const liveText  = mk(W,H), liveTextCtx  = liveText.getContext('2d');  // Live green slice
+
+  // Tunables
+  const P = {
+    speed: 0.28, kerf: 6, powerFloor: 0.4, revealLen: 40, revealWidth: 22,
+    // --- NEW: jitter knobs (pixels & Hz-ish multipliers) ---
+    jitterAmpPx: 20,           // base vertical wiggle amplitude
+    jitterFreqFast: 20.0,        // fast flicker
+    jitterFreqSlow: 2.2,        // slow drift
+    followStrengthPx: 20,      // bias toward stroke center from mask gradient
+    tipKerf: 3.2                // small tip cut radius so letters show tracing marks
+  };
+
+  const COL = {
+    slab:'#0c0d10', frame:'#13151a',
+    laserCore:'rgb(230,255,245)', laserHalo:'rgb(30,255,170)',
+    // Two-stage text colors
+    textGreenP1:'rgba(120,245,190,0.85)',   // pass 1 (lighter)
+    textGreenP2:'rgba(120,245,190,0.98)',   // pass 2 (final)
+    // Live sweep tints
+    textGreenLiveP1:'rgba(170,255,225,0.82)',
+    textGreenLiveP2:'rgba(180,255,230,0.90)'
+  };
+
+  // Layout
+  const rect = {x:Math.floor(W*0.12), y:Math.floor(H*0.18), w:Math.floor(W*0.76), h:Math.floor(H*0.64)};
+  const bbox = inset(rect, Math.floor(rect.w*0.08), Math.floor(rect.h*0.12), Math.floor(rect.w*0.08), Math.floor(rect.h*0.16));
+  const baseY = bbox.y + bbox.h;
+  const parked = { x: rect.x + 40, y: rect.y + rect.h - 40 };
+  const gantryY = rect.y - 60;
+
+  // Background art + slab
+  paintArt(artCtx);
+  slabCtx.fillStyle = COL.slab; rr(slabCtx, rect.x, rect.y, rect.w, rect.h, 12); slabCtx.fill();
+
+  // Paths for curve + baseline
+  const upper = gaussianUpperPolyline(650, bbox);
+  const upperPath = densify(upper, 2);
+  const basePts = [];
+  for (let i=upperPath.length-1; i>=0; i--) basePts.push([upperPath[i][0], baseY]);
+  const baselinePath = densify(basePts, 3);
+  const closed = upperPath.concat(baselinePath);
+  const U = upperPath.length, N = closed.length;
+  if (N < 2) { hud.textContent='Error: path too short'; return; }
+  const centroid = polygonCentroid(closed);
+
+  // Etch styles
+  etchCurveCtx.lineCap='round'; etchCurveCtx.lineJoin='round';
+  etchCurveCtx.shadowColor='rgba(60,255,180,0.85)'; etchCurveCtx.shadowBlur=16;
+  etchCurveCtx.strokeStyle='rgba(140,255,210,1)'; etchCurveCtx.lineWidth=3;
+
+  // Sparks
+  const SP = {
+    MAX_SPARKS: 3000, EMIT_RATE: 2200, SIZE:[1.1,3.2], TRAIL_SECS:0.060,
+    GRAVITY:980, DRAG:0.995, LIFETIME:[0.6,1.4],
+    SPEED_TAN:[240,560], SPEED_NRM:[-260,260], JITTER:[-40,40],
+    BOUNCE_E:0.35
+  };
+  const sparkSprite = makeSparkSprite();
+  const sparks = new Array(SP.MAX_SPARKS); let sparkCount = 0;
+
+  // === Two-line Text Setup ===
+  const L1 = "INFO 510";
+  const L2 = "Bayesian Modelling and Inference";
+  const textMask = mk(W,H), textMaskCtx = textMask.getContext('2d');
+  const sweepTmp = mk(W,H), sweepCtx = sweepTmp.getContext('2d');
+  const textCut  = mk(W,H), textCutCtx = textCut.getContext('2d');
+
+  const fontL1 = 'bold 50px Consolas, ui-monospace, monospace';
+  const fontL2 = 'bold 46px Consolas, ui-monospace, monospace';
+
+  // Centered horizontally; both lines raised higher
+  const raiseFactor = 0.16;
+  textMaskCtx.textAlign = 'center';
+  textMaskCtx.textBaseline = 'middle';
+  textMaskCtx.font = fontL1; const tw1 = textMaskCtx.measureText(L1).width;
+  textMaskCtx.font = fontL2; const tw2 = textMaskCtx.measureText(L2).width;
+  const tw = Math.max(tw1, tw2);
+
+  const tx = Math.round(clamp(bbox.x+40, bbox.x + bbox.w - 40, centroid.x));
+  const tyRaise = Math.round(bbox.h * raiseFactor);
+  const tyCenter = Math.round(clamp(bbox.y+60, bbox.y + bbox.h - 60, centroid.y - tyRaise));
+  const lineGap = 56;
+  const y1 = tyCenter - lineGap/2; // top line
+  const y2 = tyCenter + lineGap/2; // bottom line
+
+  // Build mask with both lines (white)
+  textMaskCtx.fillStyle = '#ffffff';
+  textMaskCtx.shadowColor = 'rgba(60,255,180,0.8)';
+  textMaskCtx.shadowBlur = 8;
+  textMaskCtx.font = fontL1; textMaskCtx.fillText(L1, tx, y1);
+  textMaskCtx.font = fontL2; textMaskCtx.fillText(L2, tx, y2);
+
+  // === NEW: grab text alpha once for jitter-follow sampling ===
+  const textAlpha = textMaskCtx.getImageData(0,0,W,H).data;
+
+  // Persistent text canvas style (balanced glow)
+  etchTextCtx.lineCap='round'; etchTextCtx.lineJoin='round';
+  etchTextCtx.shadowColor='rgba(60,255,180,0.65)';
+  etchTextCtx.shadowBlur=12;
+
+  // State machine
+  const PHASE = { CURVE:0, TEXT:1, DONE:2 };
+  let phase = PHASE.CURVE;
+
+  let last = performance.now();
+  let progress = 0;
+  let lastUpper = null, lastBase = null;
+
+  // Text sweep (two passes)
+  const TEXT_PASSES = 2;
+  const textMargin = 80;
+  const startX = tx - 0.5*tw - textMargin;
+  const endX   = tx + 0.5*tw + textMargin;
+
+  const sweep = {
+    x: startX, dir: 1, speed: 420, width: 80, falloff: 70, passCount: 0
+  };
+
+  hudUpdate();
+  requestAnimationFrame(loop);
+
+  function loop(now){
+    const dt = Math.min((now - last)/1000, 0.1);
+    last = now;
+
+    glowCtx.clearRect(0,0,W,H);
+    liveTextCtx.clearRect(0,0,W,H);
+
+    // Laser flicker
+    const t = now*0.001;
+    const power = clamp(P.powerFloor, 1, 0.9 + 0.35*(noise1d(t*11.7)*0.6 + noise1d(t*3.9)*0.4));
+    const widthCore = 1.6 + 0.8*(noise1d(t*7.3)*0.5 + 0.5);
+
+    let lx, ly, txv=1, tyv=0;
+
+    if (phase === PHASE.CURVE){
+      progress += P.speed * dt;
+      if (progress >= 1){
+        progress = 1;
+        phase = PHASE.TEXT;
+        hudUpdate();
+      }
+
+      const { i, tt, x0, y0, x1, y1 } = segAt(closed, progress);
+      lx = x0 + (x1 - x0) * tt;
+      ly = y0 + (y1 - y0) * tt;
+      [txv, tyv] = tangentAt(closed, i);
+
+      const gx = clamp(rect.x-60, rect.x+rect.w+60, lx);
+      drawBeam(glowCtx, gx, gantryY, lx, ly, widthCore, power);
+      emitSparks(lx, ly, txv, tyv, power, 1.0, dt);
+
+      // Cut slab + reveal wedge
+      if (inside(lx,ly,rect)){
+        slabCtx.save();
+        slabCtx.globalCompositeOperation='destination-out';
+        const g = slabCtx.createRadialGradient(lx,ly,0,lx,ly,P.kerf+1.0);
+        g.addColorStop(0,`rgba(0,0,0,${(0.30*power).toFixed(3)})`);
+        g.addColorStop(1,'rgba(0,0,0,0)');
+        slabCtx.fillStyle=g;
+        slabCtx.beginPath(); slabCtx.arc(lx,ly,P.kerf,0,Math.PI*2); slabCtx.fill();
+
+        const vx = centroid.x - lx, vy = centroid.y - ly;
+        const m = Math.hypot(vx,vy)||1; const ux = vx/m, uy = vy/m;
+        const wx = -uy, wy = ux;
+        const L = P.revealLen * (0.7 + 0.6*power);
+        const Wd = P.revealWidth;
+        slabCtx.beginPath();
+        slabCtx.moveTo(lx, ly);
+        slabCtx.lineTo(lx + ux*L + wx*Wd*0.5, ly + uy*L + wy*Wd*0.5);
+        slabCtx.lineTo(lx + ux*L - wx*Wd*0.5, ly + uy*L - wy*Wd*0.5);
+        slabCtx.closePath();
+        slabCtx.fillStyle = `rgba(0,0,0,${(0.20*power).toFixed(3)})`;
+        slabCtx.fill();
+        slabCtx.restore();
+      }
+
+      // Trace overlay (upper + baseline)
+      traceEtchBoth(etchCurveCtx, closed, U, N, iFromProgress(progress, N), tt, lastUpper, lastBase);
+      lastUpper = window._lastUpper; lastBase = window._lastBase;
+
+    } else if (phase === PHASE.TEXT){
+      // Two-pass sweep over text (passCount increments at edges)
+      sweep.x += sweep.dir * sweep.speed * dt;
+      if (sweep.dir > 0 && sweep.x > endX){
+        sweep.x = endX; sweep.dir = -1; sweep.passCount++;
+      } else if (sweep.dir < 0 && sweep.x < startX){
+        sweep.x = startX; sweep.dir = 1; sweep.passCount++;
+      }
+
+      // Laser nominal position (center of band)
+      lx = clamp(startX, endX, sweep.x + 0.5*sweep.width);
+      ly = Math.round((y1 + y2)/2);
+      txv = sweep.dir; tyv = 0;
+
+      // === NEW: vertical jitter to trace letters ===
+      // base flicker + slow drift
+      const jBase =
+        P.jitterAmpPx * ( (noise1d(t*P.jitterFreqFast)*0.6) + (noise1d((t+lx*0.001)*P.jitterFreqSlow)*0.4) - 0.5 );
+
+      // stroke-follow bias: sample text alpha above/below; move toward center
+      const sampleOffset = 2; // px
+      const aUp   = alphaAt(lx, ly - sampleOffset, textAlpha, W, H);
+      const aDown = alphaAt(lx, ly + sampleOffset, textAlpha, W, H);
+      const follow = P.followStrengthPx * ((aUp - aDown) / 255);
+
+      const lyJit = ly + jBase + follow;
+
+      const isSecondPass = (sweep.passCount >= 1 && sweep.dir === -1);
+
+      // Beam at jittered head
+      const gx = clamp(rect.x-60, rect.x+rect.w+60, lx);
+      drawBeam(glowCtx, gx, gantryY, lx, lyJit, widthCore, power);
+      emitSparks(lx, lyJit, txv, tyv, power, 1.0, dt);
+
+      // Build soft sweep band (unchanged)
+      sweepCtx.clearRect(0,0,W,H);
+      const grad = sweepCtx.createLinearGradient(
+        sweep.x - sweep.falloff, 0, sweep.x + sweep.width + sweep.falloff, 0
+      );
+      grad.addColorStop(0, 'rgba(255,255,255,0)');
+      grad.addColorStop(0.5 * sweep.falloff / (sweep.width + sweep.falloff), 'rgba(255,255,255,0.6)');
+      grad.addColorStop((sweep.falloff + sweep.width)/ (sweep.width + 2*sweep.falloff), 'rgba(255,255,255,0.9)');
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      sweepCtx.fillStyle = grad;
+      sweepCtx.fillRect(sweep.x - sweep.falloff, 0, sweep.width + 2*sweep.falloff, H);
+
+      // Intersect sweep with text mask → textCut
+      textCutCtx.clearRect(0,0,W,H);
+      textCutCtx.globalCompositeOperation = 'source-over';
+      textCutCtx.drawImage(textMask, 0, 0);
+      textCutCtx.globalCompositeOperation = 'destination-in';
+      textCutCtx.drawImage(sweepTmp, 0, 0);
+
+      // Remove slab over the core of the band so letters under beam are never dim
+      const core = mk(W,H), coreCtx = core.getContext('2d');
+      coreCtx.drawImage(textMask, 0, 0);
+      coreCtx.globalCompositeOperation = 'destination-in';
+      const coreStart = sweep.x + sweep.width * 0.30;
+      const coreWidth = sweep.width * 0.40;
+      coreCtx.fillStyle = '#fff';
+      coreCtx.fillRect(coreStart, 0, coreWidth, H);
+      slabCtx.save();
+      slabCtx.globalCompositeOperation = 'destination-out';
+      slabCtx.globalAlpha = 1.0;
+      slabCtx.drawImage(core, 0, 0);
+      slabCtx.restore();
+
+      // === NEW: tiny tip cut at jittered head, but ONLY where text exists ===
+      if (alphaAt(lx, lyJit, textAlpha, W, H) > 8){
+        slabCtx.save();
+        slabCtx.globalCompositeOperation='destination-out';
+        const rg = slabCtx.createRadialGradient(lx,lyJit,0,lx,lyJit,P.tipKerf+0.8);
+        rg.addColorStop(0,'rgba(0,0,0,0.30)');
+        rg.addColorStop(1,'rgba(0,0,0,0)');
+        slabCtx.fillStyle = rg;
+        slabCtx.beginPath(); slabCtx.arc(lx, lyJit, P.tipKerf, 0, Math.PI*2); slabCtx.fill();
+        slabCtx.restore();
+      }
+
+      // LIVE glow slice tint
+      drawLiveSlice(liveTextCtx, textCut, isSecondPass ? COL.textGreenLiveP2 : COL.textGreenLiveP1, 16);
+      drawLiveSlice(liveTextCtx, textCut, isSecondPass ? COL.textGreenLiveP2 : COL.textGreenLiveP1, 16);
+
+      // Persistent text promotion
+      if (!isSecondPass){
+        etchTextCtx.save();
+        etchTextCtx.globalCompositeOperation = 'source-over';
+        etchTextCtx.drawImage(textCut, 0, 0);
+        etchTextCtx.globalCompositeOperation = 'source-in';
+        etchTextCtx.fillStyle = COL.textGreenP1;
+        etchTextCtx.fillRect(0, 0, W, H);
+        etchTextCtx.restore();
+      } else {
+        etchTextCtx.save();
+        etchTextCtx.globalCompositeOperation = 'destination-out';
+        etchTextCtx.drawImage(textCut, 0, 0);
+        etchTextCtx.restore();
+
+        etchTextCtx.save();
+        etchTextCtx.globalCompositeOperation = 'source-over';
+        etchTextCtx.drawImage(textCut, 0, 0);
+        etchTextCtx.globalCompositeOperation = 'source-in';
+        etchTextCtx.fillStyle = COL.textGreenP2;
+        etchTextCtx.fillRect(0, 0, W, H);
+        etchTextCtx.restore();
+      }
+
+      // Done after two passes
+      if (sweep.passCount >= TEXT_PASSES){
+        // carve entire text to ensure slab can't dim it
+        slabCtx.save();
+        slabCtx.globalCompositeOperation = 'destination-out';
+        slabCtx.drawImage(textMask, 0, 0);
+        slabCtx.restore();
+
+        // touch up: stamp full text once in final color (idempotent)
+        stampFinalTwoLineText(etchTextCtx, L1, L2, tx, y1, y2, COL.textGreenP2, fontL1, fontL2);
+        phase = PHASE.DONE;
+        hudUpdate();
+      }
+
+    } else {
+      // DONE: park laser (chill sparks)
+      const lx = parked.x, ly = parked.y;
+      const gx = clamp(rect.x-60, rect.x+rect.w+60, lx);
+      drawBeam(glowCtx, gx, gantryY, lx, ly, 1.8, 0.7);
+      emitSparks(lx, ly, -1, 0, 0.7, 0.5, dt);
+    }
+
+    composeFrame();
+    requestAnimationFrame(loop);
+  }
+
+  // live slice helper
+  function drawLiveSlice(target, mask, color, blur=18){
+    target.save();
+    target.globalCompositeOperation = 'source-over';
+    target.drawImage(mask, 0, 0);
+    target.globalCompositeOperation = 'source-in';
+    target.fillStyle   = color;
+    target.shadowColor = 'rgba(60,255,180,0.9)';
+    target.shadowBlur  = blur;
+    target.fillRect(0, 0, W, H);
+    target.restore();
+  }
+
+  // final persistent two-line text (kept modest glow)
+  function stampFinalTwoLineText(g, l1, l2, x, y1, y2, color, f1, f2){
+    g.save();
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.shadowColor = 'rgba(60,255,180,0.65)';
+    g.shadowBlur  = 12;
+    g.fillStyle = color;
+
+    g.font = f1; g.fillText(l1, x, y1);
+    g.font = f2; g.fillText(l2, x, y2);
+    g.restore();
+  }
+
+  // trace etch into etchCurveCtx
+  function traceEtchBoth(g, closed, U, N, i, tt, lastU, lastB){
+    const STEPS = 12;
+    const idxf = i + tt;
+    for (let s=1; s<=STEPS; s++){
+      const k = clamp(0, N-1-Number.EPSILON, idxf - (STEPS-s)*0.25);
+      const ki = Math.floor(k);
+      const kt = k - ki;
+      const [ax,ay] = closed[ki];
+      const [bx,by] = closed[ki+1] ?? closed[ki];
+      const sx = ax + (bx-ax)*kt;
+      const sy = ay + (by-ay)*kt;
+
+      g.beginPath();
+      if (ki < U - 1){
+        if (lastU == null || ki < lastU || ki - lastU > 50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastU]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastU = ki; lastB = null;
+      } else {
+        if (lastB == null || ki < lastB || ki - lastB > 50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastB]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastB = ki; lastU = null;
+      }
+    }
+    window._lastUpper = lastU; window._lastBase = lastB;
+  }
+
+  // sparks
+  function emitSparks(lx,ly,tx,ty,power,emitFactor,dt){
+    const nx=-ty, ny=tx;
+    const want = SP.EMIT_RATE * power * dt * emitFactor;
+    const emitCount = Math.min(Math.floor(want + Math.random()), SP.MAX_SPARKS - sparkCount);
+    for (let s=0; s<emitCount; s++){
+      const vTan=rand(...SP.SPEED_TAN), vNrm=rand(...SP.SPEED_NRM);
+      const jx=rand(...SP.JITTER), jy=rand(...SP.JITTER);
+      const vx=tx*vTan + nx*vNrm + jx, vy=ty*vTan + ny*vNrm + jy;
+      const life=rand(...SP.LIFETIME), size=rand(...SP.SIZE);
+      newSpark(lx,ly,vx,vy,life,size);
+    }
+    renderSparks(glowCtx, dt);
+  }
+  function renderSparks(g,dt){
+    g.save(); g.globalCompositeOperation='lighter';
+    const drag = Math.pow(SP.DRAG, dt*60);
+    const top = rect.y;
+    let write = 0;
+    for (let idx=0; idx<sparkCount; idx++){
+      const s = sparks[idx];
+      s.life -= dt; if (s.life <= 0) continue;
+      s.vx *= drag; s.vy = s.vy*drag + SP.GRAVITY*dt;
+      s.x += s.vx*dt; s.y += s.vy*dt;
+      if (s.y>=top && s.y<=top+2 && s.vy>0 && s.x>=rect.x && s.x<=rect.x+rect.w){
+        s.y = top - 0.1; s.vy *= -SP.BOUNCE_E; s.vx *= 0.9;
+      }
+      if (s.x<-200 || s.x>W+200 || s.y<-200 || s.y>H+300) continue;
+
+      const sp = Math.hypot(s.vx, s.vy);
+      const len = Math.max(8, sp*SP.TRAIL_SECS);
+      const thick = Math.max(2, s.size*2.2);
+      const ang = Math.atan2(s.vy, s.vx);
+
+      g.translate(s.x, s.y); g.rotate(ang);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life));
+      g.drawImage(sparkSprite, -len*0.7, -thick*1.2, len*1.4, thick*2.4);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life*1.2));
+      g.drawImage(sparkSprite, -len*0.5, -thick*0.6, len*1.0, thick*1.2);
+      g.setTransform(1,0,0,1,0,0);
+
+      sparks[write++] = s;
+    }
+    sparkCount = write;
+    g.restore();
+  }
+  function newSpark(x,y,vx,vy,life,size){
+    if (sparkCount >= SP.MAX_SPARKS) return;
+    sparks[sparkCount++] = {x,y,vx,vy,life,size};
+  }
+  function makeSparkSprite(){
+    const S=96, cv=document.createElement('canvas'); cv.width=cv.height=S;
+    const c=cv.getContext('2d');
+    const g=c.createRadialGradient(S/2,S/2,1, S/2,S/2,S/2);
+    g.addColorStop(0,'rgba(255,255,255,1.0)');
+    g.addColorStop(0.15,'rgba(230,255,245,0.95)');
+    g.addColorStop(0.40,'rgba(120,255,200,0.55)');
+    g.addColorStop(1,'rgba(120,255,200,0.0)');
+    c.fillStyle=g; c.beginPath(); c.arc(S/2,S/2,S/2,0,Math.PI*2); c.fill();
+    return cv;
+  }
+
+  // beam
+  function drawBeam(g,x0,y0,x1,y1,w,p){
+    g.save(); g.globalCompositeOperation='lighter';
+    g.strokeStyle=withAlpha(COL.laserHalo,0.35*p);
+    g.lineWidth=w+6; g.lineCap='round';
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.strokeStyle=withAlpha(COL.laserCore,Math.max(0.05,p));
+    g.lineWidth=w;
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.fillStyle=withAlpha(COL.laserHalo,0.65);
+    for(let i=0;i<3;i++){ g.beginPath(); g.arc(x1,y1, 6+i*6, 0, Math.PI*2); g.fill(); }
+    g.restore();
+  }
+
+  // compose
+  function composeFrame(){
+    ctx.drawImage(art,0,0);
+    ctx.drawImage(slab,0,0);
+
+    // Gaussian/baseline
+    ctx.globalCompositeOperation='screen';
+    ctx.drawImage(etchCurve,0,0);
+
+    // Persistent text
+    ctx.globalCompositeOperation='screen';
+    ctx.globalAlpha = 0.92;
+    ctx.drawImage(etchText,0,0);
+    ctx.globalAlpha = 1;
+
+    // Beam + sparks + live sweep slice
+    ctx.globalCompositeOperation='lighter';
+    ctx.drawImage(glow,0,0);
+    ctx.drawImage(liveText,0,0);
+
+    // Frame
+    ctx.globalCompositeOperation='source-over';
+    ctx.strokeStyle=COL.frame; ctx.lineWidth=1.2;
+    rr(ctx, rect.x, rect.y, rect.w, rect.h, 12); ctx.stroke();
+  }
+
+  // HUD
+  function hudUpdate(){
+    const passNum = (sweep.passCount >= 1 && sweep.dir === -1) ? 2 : 1;
+    hud.textContent = (phase===0) ? 'Phase: Curve+Baseline' :
+                      (phase===1) ? `Phase: Text Etch (Pass ${passNum} of 2)` :
+                                    'Phase: Done';
+  }
+
+  // geometry & helpers
+  function paintArt(g){
+    const grad=g.createLinearGradient(0,0,W,H);
+    grad.addColorStop(0,'#102b1e'); grad.addColorStop(1,'#3bd6a6');
+    g.fillStyle=grad; g.fillRect(0,0,W,H);
+    g.globalAlpha=0.18; g.strokeStyle='#fff';
+    for(let x=0;x<=W;x+=40){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,H); g.stroke(); }
+    for(let y=0;y<=H;y+=40){ g.beginPath(); g.moveTo(0,y); g.lineTo(W,y); g.stroke(); }
+    g.globalAlpha=1; g.fillStyle='rgba(235,255,245,0.95)';
+    g.font='bold 46px Consolas,monospace'; g.textAlign='center'; g.textBaseline='middle';
+    g.fillText('INFO 510 - Bayesian Modelling & Inference', W/2, H*0.14);
+  }
+  function gaussianUpperPolyline(samples,box){
+    const pts=[]; for(let i=0;i<samples;i++){
+      const x=-3+6*(i/(samples-1)), y=Math.exp(-0.5*x*x);
+      const sx=box.x+((x+3)/6)*box.w, sy=box.y+box.h - y*box.h;
+      pts.push([sx,sy]);
+    } return pts;
+  }
+  function densify(pts,step=2){
+    const out=[]; for(let i=0;i<pts.length-1;i++){
+      const [x0,y0]=pts[i], [x1,y1]=pts[i+1];
+      const dx=x1-x0, dy=y1-y0, len=Math.hypot(dx,dy);
+      const n=Math.max(1,Math.floor(len/step));
+      for(let s=0;s<n;s++){ const t=s/n; out.push([x0+dx*t, y0+dy*t]); }
+    } out.push(pts.at(-1)); return out;
+  }
+  function polygonCentroid(pts){ let sx=0, sy=0; for(const p of pts){ sx+=p[0]; sy+=p[1]; } return {x:sx/pts.length, y:sy/pts.length}; }
+  function tangentAt(path,i){
+    const N = path.length;
+    const i0 = Math.max(0, Math.min(N-1, i-1));
+    const i1 = Math.max(0, Math.min(N-1, i+1));
+    const [x0,y0]=path[i0], [x1,y1]=path[i1];
+    const dx=x1-x0, dy=y1-y0, m=Math.hypot(dx,dy)||1;
+    return [dx/m, dy/m];
+  }
+  function segAt(path, prog){
+    const N = path.length;
+    const idxf = clamp(0, N-1, prog * (N - 1));
+    let i = Math.floor(idxf);
+    if (i >= N - 1) i = N - 2;
+    const tt = clamp(0, 1, idxf - i);
+    const [x0,y0] = path[i], [x1,y1] = path[i+1];
+    return { i, tt, x0, y0, x1, y1 };
+  }
+  function iFromProgress(p, N){ const idxf = clamp(0, N-1, p*(N-1)); return Math.floor(Math.min(N-2, idxf)); }
+
+  // utils
+  function mk(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
+  function inset(r,l,t,ri,b){ return {x:r.x+l, y:r.y+t, w:r.w-l-ri, h:r.h-t-b}; }
+  function rr(g,x,y,w,h,r){ g.beginPath(); g.moveTo(x+r,y);
+    g.arcTo(x+w,y, x+w,y+h, r); g.arcTo(x+w,y+h, x,y+y?0:h, r);
+  }
+  // The above rr had a glitch—fix to full rounded rect:
+  function rr(g2,x,y,w,h,r){
+    g2.beginPath();
+    g2.moveTo(x+r,y);
+    g2.arcTo(x+w,y, x+w,y+h, r);
+    g2.arcTo(x+w,y+h, x,y+h, r);
+    g2.arcTo(x,y+h, x,y, r);
+    g2.arcTo(x,y, x+w,y, r);
+    g2.closePath();
+  }
+
+  function inside(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(a,b,c){ return Math.max(a, Math.min(b,c)); }
+  function withAlpha(rgb, a){
+    if (rgb.startsWith('rgba')) {
+      return rgb.replace(/rgba\(([^)]+)\)/, (_, inner) => {
+        const parts = inner.split(',').map(s=>s.trim());
+        return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${a.toFixed(3)})`;
+      });
+    }
+    return rgb.replace('rgb(','rgba(').replace(')',','+a.toFixed(3)+')');
+  }
+  function noise1d(x){ const i=Math.floor(x), f=x-i, u=f*f*(3-2*f); return lerp(hash(i), hash(i+1), u); }
+  function hash(n){ return fract(Math.sin(n*127.1)*43758.5453123); }
+  function fract(x){ return x - Math.floor(x); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+  // sample text alpha safely
+  function alphaAt(x,y, data, w, h){
+    const xi = Math.max(0, Math.min(w-1, Math.round(x)));
+    const yi = Math.max(0, Math.min(h-1, Math.round(y)));
+    const idx = (yi*w + xi)*4 + 3;
+    return data[idx] || 0;
+  }
+
+})();
+</script>
+</body>
+</html>
