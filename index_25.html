@@ -1,0 +1,783 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Laser Etch — Multi-Laser Gaussian → Ember Text (Glowing Burn-In)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#000;
+      --slab:#0c0d10;
+      --frame:#13151a;
+    }
+    html,body{
+      margin:0;
+      height:100%;
+      background:var(--bg);
+      color:#e9fff5;
+      font:14px/1.25 ui-monospace,Consolas,Menlo,monospace;
+    }
+    .wrap{
+      display:grid;
+      place-items:center;
+      min-height:100%;
+    }
+    canvas{
+      display:block;
+      width:min(100vw,1280px);
+      height:auto;
+      max-height:92vh;
+      border-radius:12px;
+      box-shadow:0 18px 60px rgba(0,0,0,.55);
+    }
+    .hud{
+      position:fixed;
+      left:50%;
+      top:10px;
+      transform:translateX(-50%);
+      background:rgba(0,0,0,.45);
+      border:1px solid rgba(255,255,255,.08);
+      padding:6px 10px;
+      border-radius:8px;
+      color:#bfffe9;
+      font:13px Consolas,monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="c" width="1280" height="720"></canvas>
+  </div>
+  <div class="hud" id="hud">Phase 1/4 — Gaussian (multi-laser)</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const hud = document.getElementById("hud");
+
+  // ===== Layers =====
+  const bg     = mk(W,H), bgCtx     = bg.getContext("2d");
+  const slab   = mk(W,H), slabCtx   = slab.getContext("2d");
+  const curve  = mk(W,H), curveCtx  = curve.getContext("2d");
+  const border = mk(W,H), borderCtx = border.getContext("2d"); // neon border (on top of Gaussian)
+  const glow   = mk(W,H), glowCtx   = glow.getContext("2d");   // beams + sparks
+  const live   = mk(W,H), liveCtx   = live.getContext("2d");   // hit ripples
+  const embers = mk(W,H), embCtx    = embers.getContext("2d"); // NEW: ember particles (lighter)
+  const reveal = mk(W,H), revealCtx = reveal.getContext("2d"); // mint text & bloom
+  const textMask = mk(W,H), textMaskCtx = textMask.getContext("2d");
+  const textBlock = mk(W,H), textBlockCtx = textBlock.getContext("2d"); // geometry only
+
+  // ===== Background =====
+  bgCtx.fillStyle = "#000";
+  bgCtx.fillRect(0,0,W,H);
+
+  // ===== Layout =====
+  const rect = { x:Math.floor(W*0.12), y:Math.floor(H*0.18), w:Math.floor(W*0.76), h:Math.floor(H*0.64) };
+  const bbox = inset(rect, Math.floor(rect.w*0.08), Math.floor(rect.h*0.12), Math.floor(rect.w*0.08), Math.floor(rect.h*0.16));
+  const baseY = bbox.y + bbox.h;
+
+  // ===== Slab =====
+  slabCtx.fillStyle = "#0c0d10";
+  rr(slabCtx, rect.x, rect.y, rect.w, rect.h, 12);
+  slabCtx.fill();
+
+  // ===== Gaussian Paths =====
+  const upper = gaussianUpperPolyline(600, bbox);
+  const upperPath = densify(upper, 2);
+  const basePts = [];
+  for (let i=upperPath.length-1; i>=0; i--) basePts.push([upperPath[i][0], baseY]);
+  const baseline = densify(basePts, 3);
+  const closed = upperPath.concat(baseline);
+  const U = upperPath.length;
+  const N = closed.length;
+  const centroid = polygonCentroid(closed);
+
+  // ===== Park Location (laser rests here after) =====
+  const parkPoint = { x: upperPath[0][0], y: baseY };
+  const parkVerticalOrigin = { x: parkPoint.x, y: rect.y - 120 };
+
+  // ===== Drawing Styles =====
+  curveCtx.lineCap="round";
+  curveCtx.lineJoin="round";
+  curveCtx.strokeStyle="rgba(140,255,210,1)";
+  curveCtx.shadowColor="rgba(60,255,180,0.9)";
+  curveCtx.shadowBlur=16;
+  curveCtx.lineWidth=3;
+
+  borderCtx.lineCap = "round";
+  borderCtx.lineJoin = "round";
+  borderCtx.strokeStyle = "rgba(140,255,210,1)";
+  borderCtx.shadowColor = "rgba(60,255,180,0.9)";
+  borderCtx.shadowBlur = 14;
+  borderCtx.lineWidth = 2.4;
+
+  // ===== Text Mask =====
+  const L1 = "INFO 510";
+  const L2 = "Bayesian Modelling and Inference";
+  const fontL1 = "bold 50px Consolas,ui-monospace,monospace";
+  const fontL2 = "bold 46px Consolas,ui-monospace,monospace";
+  textMaskCtx.textAlign="center";
+  textMaskCtx.textBaseline="middle";
+  const tx = rect.x + rect.w/2;
+  const raiseFactor = 0.16;
+  const tyRaise = Math.round(bbox.h*raiseFactor);
+  const tyCenter = Math.round(clamp(bbox.y+60, bbox.y+bbox.h-60, (bbox.y + bbox.h/2) - tyRaise));
+  const lineGap = 56;
+  const y1 = tyCenter - lineGap/2;
+  const y2 = tyCenter + lineGap/2;
+  textMaskCtx.fillStyle="#fff";
+  textMaskCtx.shadowColor="rgba(60,255,180,0.8)";
+  textMaskCtx.shadowBlur=6;
+  textMaskCtx.font=fontL1;
+  const tw1 = textMaskCtx.measureText(L1).width;
+  textMaskCtx.fillText(L1, tx, y1);
+  textMaskCtx.font=fontL2;
+  const tw2 = textMaskCtx.measureText(L2).width;
+  textMaskCtx.fillText(L2, tx, y2);
+  const textAlphaData = textMaskCtx.getImageData(0,0,W,H).data;
+
+  const textW = Math.max(tw1, tw2);
+  const padX = 90, padY = 52;
+  const textRect = {
+    x: tx - textW/2 - padX,
+    y: y1 - padY,
+    w: textW + 2*padX,
+    h: (y2 - y1) + 2*padY
+  };
+
+  // geometry only (not drawn)
+  textBlockCtx.fillStyle = "#020403";
+  textBlockCtx.globalAlpha = 0.97;
+  rr(textBlockCtx, textRect.x, textRect.y, textRect.w, textRect.h, 14);
+  textBlockCtx.fill();
+  textBlockCtx.globalAlpha = 1;
+
+  const boxEdgePath = buildRectPath(textRect, 2);
+
+  // ===== Multi-Lasers =====
+  const multiLasers = [
+    { x: W*0.5,                y: rect.y - 90,  power:1.0, width:1.0,  phase:0.0 },
+    { x: rect.x - 90,          y: rect.y - 40,  power:0.9, width:0.95, phase:0.4 },
+    { x: rect.x + rect.w + 90, y: rect.y - 50,  power:0.9, width:0.9,  phase:1.1 },
+    { x: rect.x - 120,         y: rect.y + rect.h*0.35, power:0.8, width:0.85, phase:1.8 }
+  ];
+
+  // ===== Sparks =====
+  const SP = {
+    MAX: 1800,
+    EMIT: 1500,
+    GRAV: 980,
+    DRAG: 0.995,
+    LIFE: [0.5,1.1],
+    VT: [250,520],
+    VN: [-180,180],
+    JIT: [-30,30],
+    BOUNCE: 0.35
+  };
+  const sparkSprite = makeSparkSprite();
+  const sparks = new Array(SP.MAX);
+  let sparkCount=0;
+
+  // ===== Embers (NEW) =====
+  const EMB = {
+    MAX: 2600,
+    SPAWN_RATE: 2200,        // particles per second during early reveal
+    LIFE: [0.7, 1.8],        // seconds
+    SPEED: [-14, -4],        // upward drift (px/s)
+    JX: [-16,16],            // lateral jitter (px/s)
+    GRAV: -8,                // mild buoyancy (negative pulls up)
+    SIZE: [1.2, 3.2],        // base size (px)
+    GROW: [0.6, 1.4],        // size multiplier toward mid-life
+    ORANGE: [255, 180, 90],  // molten start
+    MINT:   [140, 255, 210], // final hue
+  };
+  const embList = new Array(EMB.MAX);
+  let embCount = 0;
+
+  // ===== State =====
+  const PHASE = { GAUSS:0, BOX_EDGE:1, BOX_JITTER:2, REVEAL:3 };
+  let phase = PHASE.GAUSS;
+
+  let last = performance.now();
+  let progGaussian = 0;
+  let progBoxEdge  = 0;
+  let lastUpper = null, lastBase = null;
+
+  let borderLastIdx = null;
+  let edgePrev = null;
+
+  let jitterStart = 0;
+  let jitterTarget = null;
+  const JITTER_DUR = 2.1;
+
+  let revealStart = 0;
+  const TEXT_REVEAL_DUR = 1.2; // a touch longer for drama
+
+  hudUpdate();
+  requestAnimationFrame(loop);
+
+  function loop(now){
+    const dt = Math.min((now - last)/1000, 0.1);
+    last = now;
+    const nowSec = now/1000;
+
+    glowCtx.clearRect(0,0,W,H);
+    liveCtx.clearRect(0,0,W,H);
+    embCtx.clearRect(0,0,W,H);
+    revealCtx.clearRect(0,0,W,H);
+
+    const t = now*0.001;
+    const basePower = clamp(0.35,1, 0.9 + 0.4*(noise1d(t*11.7)*0.6 + noise1d(t*3.9)*0.4));
+    const baseWidth = 1.4 + 0.7*(noise1d(t*7.3)*0.5 + 0.5);
+
+    if (phase === PHASE.GAUSS){
+      progGaussian += 0.42*dt;
+      if (progGaussian >= 1){
+        progGaussian = 1;
+        phase = PHASE.BOX_EDGE;
+        hudUpdate();
+        borderLastIdx = null;
+        edgePrev = null;
+      }
+
+      const {i,tt,x0,y0,x1,y1} = segAt(closed, progGaussian);
+      const lx = x0 + (x1-x0)*tt;
+      const ly = y0 + (y1-y0)*tt;
+      const [txv,tyv] = tangentAt(closed, i);
+
+      for (const src of multiLasers){
+        const pulse = 0.6 + 0.4*Math.sin( (t*3.2) + src.phase*2.0 + Math.random()*0.4 );
+        const p = clamp(0.25,1, basePower * (src.power || 1) * pulse);
+        const w = baseWidth * (src.width || 1);
+        drawBeam(glowCtx, src.x, src.y, lx, ly, w, p);
+      }
+
+      emitSparks(lx,ly,txv,tyv,basePower,1.0,dt);
+      if (inside(lx,ly,rect)){
+        carveSlabPointAndWedge(slabCtx, lx, ly, centroid, basePower);
+      }
+
+      traceCurve(curveCtx, closed, U, N, iFromProgress(progGaussian, N), tt, lastUpper, lastBase);
+      lastUpper = window._lastUpper; lastBase = window._lastBase;
+      drawLiveHit(liveCtx, lx, ly, 16);
+    }
+    else if (phase === PHASE.BOX_EDGE){
+      progBoxEdge += 0.6*dt;
+      if (progBoxEdge >= 1){
+        progBoxEdge = 1;
+        phase = PHASE.BOX_JITTER;
+        jitterStart = nowSec;
+        jitterTarget = randomPointInRect(textRect);
+        hudUpdate();
+      }
+
+      const {i,tt,x0,y0,x1,y1} = segAt(boxEdgePath, progBoxEdge);
+      const lx = x0 + (x1-x0)*tt;
+      const ly = y0 + (y1-y0)*tt;
+      const [txv,tyv] = tangentAt(boxEdgePath, i);
+
+      for (const src of multiLasers){
+        const pulse = 0.55 + 0.45*Math.sin( (t*3.6) + src.phase*1.6 );
+        const p = clamp(0.25,1, basePower * (src.power || 1) * pulse);
+        const w = baseWidth * (src.width || 1);
+        drawBeam(glowCtx, src.x, src.y, lx, ly, w, p);
+      }
+
+      emitSparks(lx,ly,txv,tyv,basePower,0.85,dt);
+      drawLiveHit(liveCtx, lx, ly, 13);
+
+      if (edgePrev == null) edgePrev = {x:lx, y:ly};
+      carveSlabStroke(slabCtx, edgePrev.x, edgePrev.y, lx, ly, 6);
+      edgePrev = {x:lx, y:ly};
+
+      traceBorder(borderCtx, boxEdgePath, i, tt, borderLastIdx);
+      borderLastIdx = window._lastBorderIdx;
+    }
+    else if (phase === PHASE.BOX_JITTER){
+      const elapsed = nowSec - jitterStart;
+      if (!jitterTarget || Math.random() < 0.2){
+        jitterTarget = randomPointInRect(textRect);
+      }
+      const lx = jitterTarget.x;
+      const ly = jitterTarget.y;
+
+      for (const src of multiLasers){
+        const pulse = 0.6 + 0.4*Math.sin( (t*4.1) + src.phase*2.3 );
+        const p = clamp(0.25,1, basePower * (src.power || 1) * pulse);
+        const w = baseWidth * (src.width || 1);
+        drawBeam(glowCtx, src.x, src.y, lx, ly, w, p);
+      }
+
+      emitSparks(lx,ly,0,-1,basePower,1.0,dt);
+      drawLiveHit(liveCtx, lx, ly, 10);
+      carveSlabPointAndWedge(slabCtx, lx, ly, {x:lx,y:ly}, basePower*0.4, 4);
+
+      if (elapsed >= JITTER_DUR){
+        phase = PHASE.REVEAL;
+        revealStart = nowSec + 0.45; // slight pause before ignite
+        hudUpdate();
+      }
+    }
+    else {
+      // Merge all beams to a single vertical park beam
+      const tmerge = clamp(0,1, (nowSec - revealStart + 0.25)/0.6 );
+      for (const src of multiLasers){
+        const ox = lerp(src.x, parkVerticalOrigin.x, tmerge);
+        const oy = lerp(src.y, parkVerticalOrigin.y, tmerge);
+        const pulse = 0.6 + 0.4*Math.sin(nowSec*9 + src.phase);
+        const p = clamp(0.3,1, 0.7*pulse);
+        drawBeam(glowCtx, ox, oy, parkPoint.x, parkPoint.y, 1.6, p);
+      }
+      emitSparks(parkPoint.x, parkPoint.y, 0,1,0.6,0.4,dt);
+
+      // ===== EMBER BURN-IN EFFECT =====
+      const el = nowSec - revealStart;
+      if (el > 0){
+        const fade = clamp(0,1, el / TEXT_REVEAL_DUR);     // main text fade
+        const ignite = easeOutCubic(fade);                 // smoother rise
+        const pulse = 0.85 + 0.15*Math.sin(nowSec*8.0);    // subtle glow pulse
+
+        // spawn embers heavier at start; taper toward end
+        const spawnGain = (1.0 - fade) * 1.0 + 0.15;       // stays >0 for a bit
+        updateEmbers(dt, spawnGain, textRect, textAlphaData);
+
+        // render embers (additive)
+        renderEmbers(embCtx, ignite);
+
+        // heat bloom under text that transitions orange -> mint
+        const bloom = mk(W,H), bctx = bloom.getContext('2d');
+        bctx.drawImage(textMask,0,0);
+        bctx.globalCompositeOperation='source-in';
+        const [r0,g0,b0] = EMB.ORANGE, [r1,g1,b1] = EMB.MINT;
+        const rr = Math.round(lerp(r0,r1, ignite*0.6));
+        const gg = Math.round(lerp(g0,g1, ignite*0.6));
+        const bb = Math.round(lerp(b0,b1, ignite*0.6));
+        bctx.fillStyle = `rgba(${rr},${gg},${bb},${(0.35*pulse).toFixed(3)})`;
+        bctx.shadowColor = `rgba(${rr},${gg},${bb},0.9)`;
+        bctx.shadowBlur = 20 + 20*ignite;
+        bctx.fillRect(0,0,W,H);
+        revealCtx.globalCompositeOperation='lighter';
+        revealCtx.drawImage(bloom,0,0);
+
+        // final mint text rising in strength
+        const mint = mk(W,H), mctx = mint.getContext('2d');
+        mctx.drawImage(textMask,0,0);
+        mctx.globalCompositeOperation='source-in';
+        mctx.fillStyle = "rgba(140,255,210,1)";
+        mctx.fillRect(0,0,W,H);
+        revealCtx.globalAlpha = ignite * (0.92 + 0.08*pulse);
+        revealCtx.globalCompositeOperation='screen';
+        revealCtx.drawImage(mint,0,0);
+        revealCtx.globalAlpha = 1;
+      }
+    }
+
+    composeFrame();
+    requestAnimationFrame(loop);
+  }
+
+  function composeFrame(){
+    ctx.globalCompositeOperation='source-over';
+    ctx.drawImage(bg,0,0);
+    ctx.drawImage(slab,0,0);
+
+    // Gaussian/baseline
+    ctx.globalCompositeOperation='screen';
+    ctx.drawImage(curve,0,0);
+
+    // Neon border ON TOP of Gaussian
+    ctx.globalCompositeOperation='screen';
+    ctx.drawImage(border,0,0);
+
+    // Live hits, beams/sparks, EMBERS, and reveal bloom/text
+    ctx.globalCompositeOperation='lighter';
+    ctx.drawImage(live,0,0);
+    ctx.drawImage(glow,0,0);
+    ctx.drawImage(embers,0,0);
+    ctx.drawImage(reveal,0,0);
+
+    // Frame
+    ctx.globalCompositeOperation='source-over';
+    ctx.strokeStyle = "#13151a";
+    ctx.lineWidth = 1.2;
+    rr(ctx, rect.x, rect.y, rect.w, rect.h, 12);
+    ctx.stroke();
+  }
+
+  function hudUpdate(){
+    hud.textContent =
+      (phase===0) ? "Phase 1/4 — Gaussian (multi-laser)"
+    : (phase===1) ? "Phase 2/4 — Text box edge (carving neon border)"
+    : (phase===2) ? "Phase 3/4 — Jitter cuts in box (multi-laser)"
+    : "Phase 4/4 — Merge to 1 beam + EMBER burn-in → mint text";
+  }
+
+  // ===== Carving & Drawing Helpers =====
+  function carveSlabPointAndWedge(g,lx,ly,centroid,power,kerf=6){
+    g.save();
+    g.globalCompositeOperation='destination-out';
+    const rad = kerf + 1.5;
+    const gr = g.createRadialGradient(lx,ly,0,lx,ly,rad);
+    gr.addColorStop(0,`rgba(0,0,0,${(0.35*power).toFixed(3)})`);
+    gr.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle=gr;
+    g.beginPath(); g.arc(lx,ly,kerf,0,Math.PI*2); g.fill();
+
+    // small reveal wedge
+    const vx = centroid.x - lx, vy = centroid.y - ly;
+    const m = Math.hypot(vx,vy)||1;
+    const ux = vx/m, uy = vy/m;
+    const wx = -uy, wy = ux;
+    const L = 32*(0.6+0.4*power);
+    const Wd = 16;
+    g.beginPath();
+    g.moveTo(lx,ly);
+    g.lineTo(lx+ux*L+wx*(Wd*0.5), ly+uy*L+wy*(Wd*0.5));
+    g.lineTo(lx+ux*L-wx*(Wd*0.5), ly+uy*L-wy*(Wd*0.5));
+    g.closePath();
+    g.fillStyle=`rgba(0,0,0,${(0.22*power).toFixed(3)})`;
+    g.fill();
+    g.restore();
+  }
+
+  function carveSlabStroke(g, x0, y0, x1, y1, widthPx){
+    g.save();
+    g.globalCompositeOperation = 'destination-out';
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    g.strokeStyle = 'rgba(0,0,0,1)';
+    g.lineWidth = widthPx;
+    g.beginPath();
+    g.moveTo(x0,y0);
+    g.lineTo(x1,y1);
+    g.stroke();
+    g.restore();
+  }
+
+  function traceCurve(g, closed, U, N, i, tt, lastU, lastB){
+    const STEPS = 10;
+    const idxf = i + tt;
+    for (let s=0;s<=STEPS;s++){
+      const k = clamp(0, N-1-1e-4, idxf - (STEPS-s)*0.25);
+      const ki = Math.floor(k);
+      const kt = k - ki;
+      const [ax,ay] = closed[ki];
+      const [bx,by] = closed[ki+1] ?? closed[ki];
+      const sx = ax + (bx-ax)*kt;
+      const sy = ay + (by-ay)*kt;
+      g.beginPath();
+      if (ki < U-1){
+        if (lastU==null || ki<lastU || ki-lastU>50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastU]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastU=ki; lastB=null;
+      } else {
+        if (lastB==null || ki<lastB || ki-lastB>50) g.moveTo(sx,sy);
+        else { const [px,py] = closed[lastB]; g.moveTo(px,py); }
+        g.lineTo(sx,sy); g.stroke(); lastB=ki; lastU=null;
+      }
+    }
+    window._lastUpper = lastU;
+    window._lastBase  = lastB;
+  }
+
+  function traceBorder(g, path, i, tt, lastIdx){
+    const STEPS = 10;
+    const idxf = i + tt;
+    let L = (lastIdx==null) ? Math.max(0, Math.floor(idxf) - 1) : lastIdx;
+    for (let s=0; s<=STEPS; s++){
+      const k = clamp(0, path.length-1-1e-4, idxf - (STEPS-s)*0.25);
+      const ki = Math.floor(k);
+      const kt = k - ki;
+      const [ax,ay] = path[ki];
+      const [bx,by] = path[ki+1] ?? path[ki];
+      const sx = ax + (bx-ax)*kt;
+      const sy = ay + (by-ay)*kt;
+
+      g.beginPath();
+      if (L==null || ki < L || ki - L > 50) g.moveTo(sx,sy);
+      else {
+        const [px,py] = path[L];
+        g.moveTo(px,py);
+      }
+      g.lineTo(sx,sy);
+      g.stroke();
+      L = ki;
+    }
+    window._lastBorderIdx = L;
+  }
+
+  function drawBeam(g,x0,y0,x1,y1,w,p){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    g.strokeStyle = `rgba(30,255,170,${(0.4*p).toFixed(3)})`;
+    g.lineWidth = w+6;
+    g.lineCap='round';
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.strokeStyle = `rgba(230,255,245,${(Math.max(0.05,p)).toFixed(3)})`;
+    g.lineWidth = w;
+    g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
+    g.fillStyle = "rgba(30,255,170,0.7)";
+    for (let i=0;i<3;i++){
+      g.beginPath(); g.arc(x1,y1, 5+i*5, 0, Math.PI*2); g.fill();
+    }
+    g.restore();
+  }
+
+  // ===== Embers =====
+  function updateEmbers(dt, spawnGain, r, alphaData){
+    // spawn (heavier early)
+    const want = EMB.SPAWN_RATE * spawnGain * dt;
+    const count = Math.min(Math.floor(want + Math.random()), EMB.MAX - embCount);
+    for (let i=0;i<count;i++){
+      // pick a random point inside letters
+      let px, py, tries=0;
+      do {
+        px = r.x + Math.random()*r.w;
+        py = r.y + Math.random()*r.h;
+        tries++;
+        if (tries>20) break;
+      } while (alphaAt(px,py,alphaData,W,H) <= 5);
+
+      if (tries>20) continue;
+      const life = rand(EMB.LIFE[0], EMB.LIFE[1]);
+      const vy = rand(EMB.SPEED[0], EMB.SPEED[1]);
+      const vx = rand(EMB.JX[0], EMB.JX[1]);
+      const size = rand(EMB.SIZE[0], EMB.SIZE[1]);
+      const grow = rand(EMB.GROW[0], EMB.GROW[1]);
+
+      if (embCount >= EMB.MAX) break;
+      embList[embCount++] = {
+        x:px, y:py, vx, vy,
+        t:0, life, size, grow
+      };
+    }
+
+    // integrate
+    let write=0;
+    for (let i=0;i<embCount;i++){
+      const e = embList[i];
+      e.t += dt;
+      if (e.t >= e.life) continue;
+
+      // buoyancy + small noise
+      e.vy += EMB.GRAV * dt;               // negative pulls up slowly
+      e.vx += (noise1d((e.x+e.t)*0.03)-0.5) * 8 * dt;
+      e.vy += (noise1d((e.y-e.t)*0.03)-0.5) * 6 * dt;
+
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+
+      // keep within canvas bounds
+      if (e.x < -40 || e.x > W+40 || e.y < -40 || e.y > H+80) continue;
+
+      embList[write++] = e;
+    }
+    embCount = write;
+  }
+
+  function renderEmbers(g, ignite){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    for (let i=0;i<embCount;i++){
+      const e = embList[i];
+      const k = clamp(0,1, e.t / e.life);                // 0..1
+      const heat = Math.sin(Math.PI * Math.min(1, k));   // flare mid-life
+      const sz = e.size * (1 + e.grow * heat * 0.6);
+
+      // color: orange → mint as ignite grows and ember ages
+      const blend = clamp(0,1, 0.25 + 0.55*ignite + 0.35*k);
+      const r = Math.round(lerp(EMB.ORANGE[0], EMB.MINT[0], blend));
+      const gg= Math.round(lerp(EMB.ORANGE[1], EMB.MINT[1], blend));
+      const b = Math.round(lerp(EMB.ORANGE[2], EMB.MINT[2], blend));
+
+      const aCore = 0.15 + 0.55*(1-k) + 0.25*heat;       // brighter early/mid
+      const aHalo = 0.10 + 0.45*(1-k);
+
+      // halo
+      const rad = sz*3.2;
+      const gr = g.createRadialGradient(e.x,e.y,0, e.x,e.y,rad);
+      gr.addColorStop(0,   `rgba(${r},${gg},${b},${(aCore).toFixed(3)})`);
+      gr.addColorStop(0.4, `rgba(${r},${gg},${b},${(aHalo).toFixed(3)})`);
+      gr.addColorStop(1,   `rgba(${r},${gg},${b},0)`);
+      g.fillStyle = gr;
+      g.beginPath(); g.arc(e.x, e.y, rad, 0, Math.PI*2); g.fill();
+
+      // core
+      g.fillStyle = `rgba(${r},${gg},${b},${(aCore).toFixed(3)})`;
+      g.beginPath(); g.arc(e.x, e.y, sz*0.6, 0, Math.PI*2); g.fill();
+    }
+    g.restore();
+  }
+
+  // ===== Sparks =====
+  function emitSparks(lx,ly,tx,ty,power,emit,dt){
+    const nx = -ty, ny = tx;
+    const want = SP.EMIT * power * emit * dt;
+    const count = Math.min(Math.floor(want + Math.random()), SP.MAX - sparkCount);
+    for (let i=0;i<count;i++){
+      const vT = rand(SP.VT[0], SP.VT[1]);
+      const vN = rand(SP.VN[0], SP.VN[1]);
+      const jx = rand(SP.JIT[0], SP.JIT[1]);
+      const jy = rand(SP.JIT[0], SP.JIT[1]);
+      const vx = tx*vT + nx*vN + jx;
+      const vy = ty*vT + ny*vN + jy;
+      const life = rand(SP.LIFE[0], SP.LIFE[1]);
+      const size = rand(1.1,2.7);
+      newSpark(lx,ly,vx,vy,life,size);
+    }
+    renderSparks(glowCtx, dt);
+  }
+
+  function renderSparks(g,dt){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    const drag = Math.pow(SP.DRAG, dt*60);
+    const top = rect.y;
+    let write=0;
+    for (let i=0;i<sparkCount;i++){
+      const s = sparks[i];
+      s.life -= dt; if (s.life<=0) continue;
+      s.vx *= drag; s.vy = s.vy*drag + SP.GRAV*dt;
+      s.x += s.vx*dt; s.y += s.vy*dt;
+      if (s.y>=top && s.y<=top+2 && s.vy>0 && s.x>=rect.x && s.x<=rect.x+rect.w){
+        s.y = top-0.1; s.vy *= -SP.BOUNCE; s.vx *= 0.9;
+      }
+      if (s.x<-200 || s.x>W+200 || s.y<-200 || s.y>H+300) continue;
+      const spd = Math.hypot(s.vx,s.vy);
+      const len = Math.max(8, spd*0.055);
+      const th  = Math.max(2, s.size*2);
+      const ang = Math.atan2(s.vy,s.vx);
+      g.translate(s.x,s.y); g.rotate(ang);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life));
+      g.drawImage(sparkSprite, -len*0.7, -th*1.0, len*1.4, th*2.0);
+      g.globalAlpha = Math.max(0, Math.min(1, s.life*1.1));
+      g.drawImage(sparkSprite, -len*0.4, -th*0.5, len*0.8, th);
+      g.setTransform(1,0,0,1,0,0);
+      sparks[write++] = s;
+    }
+    sparkCount = write;
+    g.restore();
+  }
+
+  function newSpark(x,y,vx,vy,life,size){
+    if (sparkCount >= SP.MAX) return;
+    sparks[sparkCount++] = {x,y,vx,vy,life,size};
+  }
+
+  function makeSparkSprite(){
+    const S=90, cv=document.createElement('canvas'); cv.width=cv.height=S;
+    const c=cv.getContext('2d');
+    const g=c.createRadialGradient(S/2,S/2,1, S/2,S/2,S/2);
+    g.addColorStop(0,'rgba(255,255,255,1)');
+    g.addColorStop(0.15,'rgba(230,255,245,0.95)');
+    g.addColorStop(0.4,'rgba(140,255,210,0.55)');
+    g.addColorStop(1,'rgba(140,255,210,0)');
+    c.fillStyle=g; c.beginPath(); c.arc(S/2,S/2,S/2,0,Math.PI*2); c.fill();
+    return cv;
+  }
+
+  // ===== Misc Visuals =====
+  function drawLiveHit(g,x,y,r){
+    g.save();
+    g.globalCompositeOperation='lighter';
+    const gr = g.createRadialGradient(x,y,0,x,y,r);
+    gr.addColorStop(0,'rgba(155,255,210,1)');
+    gr.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle=gr;
+    g.beginPath(); g.arc(x,y,r,0,Math.PI*2); g.fill();
+    g.restore();
+  }
+
+  // ===== Geometry =====
+  function buildRectPath(r, step){
+    const pts = [
+      [r.x,     r.y],
+      [r.x+r.w, r.y],
+      [r.x+r.w, r.y+r.h],
+      [r.x,     r.y+r.h],
+      [r.x,     r.y]
+    ];
+    return densify(pts, step);
+  }
+
+  function randomPointInRect(r){
+    return { x: r.x + Math.random()*r.w, y: r.y + Math.random()*r.h };
+  }
+
+  function gaussianUpperPolyline(samples, box){
+    const pts=[];
+    for (let i=0;i<samples;i++){
+      const x = -3 + 6*(i/(samples-1));
+      const y = Math.exp(-0.5*x*x);
+      const sx = box.x + ((x+3)/6)*box.w;
+      const sy = box.y + box.h - y*box.h;
+      pts.push([sx,sy]);
+    }
+    return pts;
+  }
+  function densify(pts, step=2){
+    const out=[];
+    for (let i=0;i<pts.length-1;i++){
+      const [x0,y0]=pts[i], [x1,y1]=pts[i+1];
+      const dx=x1-x0, dy=y1-y0, len=Math.hypot(dx,dy);
+      const n = Math.max(1, Math.floor(len/step));
+      for (let s=0;s<n;s++){
+        const t=s/n;
+        out.push([x0+dx*t, y0+dy*t]);
+      }
+    }
+    out.push(pts.at(-1));
+    return out;
+  }
+  function polygonCentroid(pts){
+    let sx=0,sy=0; for (const p of pts){ sx+=p[0]; sy+=p[1]; }
+    return {x:sx/pts.length, y:sy/pts.length};
+  }
+  function tangentAt(path, i){
+    const N = path.length;
+    const i0 = Math.max(0, Math.min(N-1, i-1));
+    const i1 = Math.max(0, Math.min(N-1, i+1));
+    const [x0,y0] = path[i0];
+    const [x1,y1] = path[i1];
+    const dx=x1-x0, dy=y1-y0, m=Math.hypot(dx,dy)||1;
+    return [dx/m, dy/m];
+  }
+  function segAt(path, prog){
+    const N = path.length;
+    const idxf = clamp(0, N-1, prog*(N-1));
+    let i = Math.floor(idxf);
+    if (i >= N - 1) i = N - 2;
+    const tt = clamp(0, 1, idxf - i);
+    const [x0,y0] = path[i], [x1,y1] = path[i+1];
+    return { i, tt, x0, y0, x1, y1 };
+  }
+  function iFromProgress(p,N){
+    const idxf = clamp(0, N-1, p*(N-1));
+    return Math.floor(Math.min(N-2, idxf));
+  }
+
+  // ===== Utilities =====
+  function mk(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
+  function inset(r,l,t,ri,b){ return {x:r.x+l, y:r.y+t, w:r.w-l-ri, h:r.h-t-b}; }
+  function rr(g,x,y,w,h,r){ g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+  function inside(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+  function alphaAt(x,y,data,w,h){
+    const xi = Math.max(0, Math.min(w-1, Math.round(x)));
+    const yi = Math.max(0, Math.min(h-1, Math.round(y)));
+    const idx = yi*w*4 + xi*4 + 3;
+    return data[idx] || 0;
+  }
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(a,b,c){ return Math.max(a, Math.min(b, c)); }
+  function noise1d(x){ const i=Math.floor(x), f=x-i, u=f*f*(3-2*f); return lerp(hash(i), hash(i+1), u); }
+  function hash(n){ return fract(Math.sin(n*127.1)*43758.5453123); }
+  function fract(x){ return x - Math.floor(x); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+  function easeOutCubic(x){ return 1 - Math.pow(1 - x, 3); }
+
+})();
+</script>
+</body>
+</html>

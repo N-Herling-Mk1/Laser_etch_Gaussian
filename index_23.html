@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Stationary Wedge · Rotating Dial · Pseudo Display</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    /* ====== THEME ====== */
+    :root{
+      --bg: #000;
+      --panel-bg: radial-gradient(circle at 50% 50%, #020617 0%, #000 60%, #000 100%);
+      --dial-ring: radial-gradient(circle, rgba(15,118,110,0.6) 0%, rgba(15,23,42,0) 60%);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --wedge-fill: radial-gradient(circle at 10% 50%, rgba(18,252,142,0.15) 0%, rgba(0,0,0,0) 60%);
+      --wedge-line: rgba(190,255,210,0.9);
+      --hud-bg: rgba(2,6,23,0.55);
+      --hud-border: rgba(148,163,184,.45);
+      --hud-glow: rgba(34,197,94,.25);
+    }
+
+    /* ====== PAGE ====== */
+    html,body{
+      margin:0;
+      height:100%;
+      background:var(--bg);
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+      color:var(--text);
+    }
+
+    /* ====== SHELL / PANEL (wider) ====== */
+    .shell{
+      width: min(92vw, 1100px);
+      aspect-ratio: 16 / 9;
+      background:var(--panel-bg);
+      border:1px solid rgba(148,163,184,.12);
+      border-radius:22px;
+      position:relative;
+      display:grid;
+      place-items:center;
+      overflow:hidden;
+      box-shadow:0 20px 60px rgba(0,0,0,.45);
+    }
+
+    /* ====== DIAL (rotates) ====== */
+    .dial{
+      position:absolute;
+      width:58%;
+      aspect-ratio:1/1;
+      border-radius:50%;
+      background:
+        conic-gradient(from 0deg,
+          rgba(148,163,184,0.08) 0deg 2deg,
+          rgba(0,0,0,0) 2deg 15deg
+        ),
+        radial-gradient(circle, rgba(15,118,110,0.7) 0%, rgba(15,23,42,0) 58%);
+      border:1px solid rgba(148,163,184,.08);
+      filter:drop-shadow(0 0 22px rgba(16,185,129,.35));
+      transform-origin:50% 50%;
+      z-index: 0;
+    }
+
+    /* ====== STATIONARY WEDGE ====== */
+    .wedge{
+      position:absolute;
+      width:140%;
+      height:140%;
+      pointer-events:none;
+      z-index: 2;
+    }
+    .wedge-shape{
+      position:absolute;
+      inset:0;
+      clip-path:polygon(50% 50%, 100% 36%, 100% 64%);
+      background:var(--wedge-fill);
+      border-right:2px solid rgba(190,255,210,0.25);
+      filter:drop-shadow(0 0 10px rgba(34,197,94,0.35));
+      z-index: 1;
+    }
+
+    /* ====== METRIC HUD (moved to left) ====== */
+    .metric-box{
+      position:absolute;
+      top:50%;
+      right:15%;                 /* moved left */
+      transform:translateY(-50%);
+      min-width: 170px;
+      background:var(--hud-bg);
+      border:1px solid var(--hud-border);
+      border-radius:14px;
+      padding:8px 12px 7px;
+      text-align:left;         /* align text to left */
+      backdrop-filter:blur(6px);
+      box-shadow:0 0 15px var(--hud-glow);
+      z-index: 3;
+      white-space: nowrap;
+    }
+    .metric-label{
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.06em;
+      color:var(--muted);
+    }
+    .metric-value{
+      font-size:22px;
+      font-weight:700;
+      color:#e2fbe6;
+      text-shadow:0 0 7px rgba(34,197,94,.65);
+      line-height:1.05;
+    }
+    .metric-note{
+      font-size:11px;
+      color:#cbd5f5;
+      opacity:.75;
+      margin-top:2px;
+    }
+
+    /* ====== TAG / TITLE ====== */
+    .tag{
+      position:absolute;
+      top:14px;
+      left:16px;
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.12em;
+      color:var(--muted);
+      z-index: 4;
+    }
+
+    @media (max-width: 640px){
+      .shell{ width: 96vw; }
+      .metric-box{ left:6%; min-width:150px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="tag">pseudo metric wedge</div>
+
+    <!-- rotating element -->
+    <div class="dial" id="dial"></div>
+
+    <!-- stationary inspecting wedge -->
+    <div class="wedge">
+      <div class="wedge-shape"></div>
+      <div class="metric-box">
+        <div class="metric-label" id="m-label">CPU load</div>
+        <div class="metric-value" id="m-value">47%</div>
+        <div class="metric-note" id="m-note">within operating band</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const dial    = document.getElementById('dial');
+    const mLabel  = document.getElementById('m-label');
+    const mValue  = document.getElementById('m-value');
+    const mNote   = document.getElementById('m-note');
+
+    const SECTORS = [
+      { name: 'CPU load',  value: '47%',      note: 'band: ok' },
+      { name: 'GPU temp',  value: '62°C',     note: 'fan duty 41%' },
+      { name: 'RAM usage', value: '11.9 GB',  note: 'stable alloc' },
+      { name: 'Net in',    value: '238 Mbps', note: 'burst risk' },
+      { name: 'Net out',   value: '118 Mbps', note: 'stable' },
+      { name: 'Disk i/o',  value: '354 MB/s', note: 'seq write' },
+      { name: 'QPS',       value: '7.8k/s',   note: 'p95: 24 ms' },
+      { name: 'Errors',    value: '0',        note: 'clear' },
+    ];
+
+    let angle = 0;
+    const SPEED = 24;
+    let lastTS = performance.now();
+
+    function frame(now){
+      const dt = (now - lastTS) / 1000;
+      lastTS = now;
+      angle = (angle + SPEED * dt) % 360;
+      dial.style.transform = `rotate(${angle}deg)`;
+      updateMetricForAngle(angle);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    function updateMetricForAngle(deg){
+      const N = SECTORS.length;
+      const sectorSize = 360 / N;
+      const visible = ((360 - deg) % 360) / sectorSize;
+      const idx = Math.floor(visible) % N;
+      const s = SECTORS[idx];
+      mLabel.textContent = s.name;
+      mValue.textContent = s.value;
+      mNote.textContent  = s.note;
+    }
+  </script>
+</body>
+</html>
