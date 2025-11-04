@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Laser Etch — Multi-Laser Gaussian → Ember Text (Letter Sparks)</title>
+  <title>Laser Etch — Multi-Laser Gaussian → Ember Text (Fewer but Stronger Cut Sparks + Solid Connectivity)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     :root{
@@ -41,6 +41,8 @@
       border-radius:8px;
       color:#bfffe9;
       font:13px Consolas,monospace;
+      pointer-events:none;
+      user-select:none;
     }
   </style>
 </head>
@@ -48,7 +50,7 @@
   <div class="wrap">
     <canvas id="c" width="1280" height="720"></canvas>
   </div>
-  <div class="hud" id="hud">Phase 1/4 — Gaussian (multi-laser)</div>
+  <div class="hud" id="hud">Phase 1/5 — Gaussian (multi-laser)</div>
 
   <script>
   (() => {
@@ -60,8 +62,10 @@
     /* ================= Layers ================= */
     const bg     = mk(W,H), bgCtx     = bg.getContext("2d");
     const slab   = mk(W,H), slabCtx   = slab.getContext("2d");
-    const curve  = mk(W,H), curveCtx  = curve.getContext("2d");
-    const border = mk(W,H), borderCtx = border.getContext("2d");
+    const curve  = mk(W,H), curveCtx  = curve.getContext("2d");          // glow stroke
+    const curveSolid = mk(W,H), curveSolidCtx = curveSolid.getContext("2d"); // solid under-stroke
+    const border = mk(W,H), borderCtx = border.getContext("2d");          // glow stroke
+    const borderSolid = mk(W,H), borderSolidCtx = borderSolid.getContext("2d"); // solid under-stroke
     const glow   = mk(W,H), glowCtx   = glow.getContext("2d");
     const live   = mk(W,H), liveCtx   = live.getContext("2d");
     const embers = mk(W,H), embCtx    = embers.getContext("2d");
@@ -84,12 +88,12 @@
     rr(slabCtx, rect.x, rect.y, rect.w, rect.h, 12);
     slabCtx.fill();
 
-    /* ================= Gaussian Paths ================= */
-    const upper = gaussianUpperPolyline(600, bbox);
-    const upperPath = densify(upper, 2);
+    /* ================= Gaussian Paths (even denser + solid under-stroke) ================= */
+    const upper = gaussianUpperPolyline(1000, bbox);      // more samples (800→1000)
+    const upperPath = densify(upper, 0.9);                // denser (1.25→0.9)
     const basePts = [];
     for (let i=upperPath.length-1; i>=0; i--) basePts.push([upperPath[i][0], baseY]);
-    const baseline = densify(basePts, 3);
+    const baseline = densify(basePts, 0.9);
     const closed = upperPath.concat(baseline);
     const U = upperPath.length;
     const N = closed.length;
@@ -100,19 +104,27 @@
     const parkVerticalOrigin = { x: parkPoint.x, y: rect.y - 120 };
 
     /* ================= Styles ================= */
-    curveCtx.lineCap="round";
-    curveCtx.lineJoin="round";
+    // Glow strokes
+    curveCtx.lineCap="round";  curveCtx.lineJoin="round";  curveCtx.miterLimit = 2;
     curveCtx.strokeStyle="rgba(140,255,210,1)";
     curveCtx.shadowColor="rgba(60,255,180,0.9)";
     curveCtx.shadowBlur=16;
-    curveCtx.lineWidth=3;
+    curveCtx.lineWidth=3.6;  // thicker (3→3.6)
 
-    borderCtx.lineCap = "round";
-    borderCtx.lineJoin = "round";
+    borderCtx.lineCap = "round"; borderCtx.lineJoin = "round"; borderCtx.miterLimit = 2;
     borderCtx.strokeStyle = "rgba(140,255,210,1)";
     borderCtx.shadowColor = "rgba(60,255,180,0.9)";
     borderCtx.shadowBlur = 14;
-    borderCtx.lineWidth = 2.4;
+    borderCtx.lineWidth = 3.0;  // thicker (2.4→3.0)
+
+    // Solid under-strokes (quiet mint)
+    curveSolidCtx.lineCap="round"; curveSolidCtx.lineJoin="round";
+    curveSolidCtx.strokeStyle="rgba(120,230,200,0.9)";
+    curveSolidCtx.lineWidth=1.3;
+
+    borderSolidCtx.lineCap="round"; borderSolidCtx.lineJoin="round";
+    borderSolidCtx.strokeStyle="rgba(120,230,200,0.9)";
+    borderSolidCtx.lineWidth=1.3;
 
     /* ================= Text Mask ================= */
     const L1 = "INFO 510";
@@ -157,7 +169,7 @@
     textBlockCtx.fill();
     textBlockCtx.globalAlpha = 1;
 
-    const boxEdgePath = buildRectPath(textRect, 2);
+    const boxEdgePath = buildRectPath(textRect, 0.9);   // denser (1.25→0.9)
 
     /* ================= Multi-Lasers ================= */
     const multiLasers = [
@@ -167,62 +179,78 @@
       { x: rect.x - 120,         y: rect.y + rect.h*0.35, power:0.8, width:0.85, phase:1.8 }
     ];
 
-    /* ================= Sparks ================= */
+    /* ================= Sparks (global base) ================= */
+    // Keep base behavior for Gaussian/box; we'll override for cut-text phases.
     const SP = {
-      MAX: 2200,
+      MAX: 2400,
       EMIT: 1700,
       GRAV: 980,
       DRAG: 0.995,
-      LIFE: [0.5,1.1],
-      VT: [250,520],
-      VN: [-180,180],
-      JIT: [-30,30],
+      LIFE: [0.5,1.0],
+      VT: [240,520],
+      VN: [-160,160],
+      JIT: [-26,26],
       BOUNCE: 0.35
     };
     const sparkSprite = makeSparkSprite();
     const sparks = new Array(SP.MAX);
     let sparkCount=0;
 
-    /* ================= Letter-Spark Tunables ================= */
-    const LETTER_SPARK = {
-      RATE: 100,                 // avg sparks/sec from letters (final phase)
-      SPEED: [90, 220],         // initial speed range
-      LIFE: [0.7, 0.9],        // shorter, flickery
-      SIZE: [0.8, 1.8],         // small glints
-      ANGLE_BIAS: [-1.5, 1.5], // radians around straight-up (-PI/2 ≈ -1.57); this is a gentle upward bias
-      JITTER: 0.45              // random extra wobble proportion
+    /* ================= Cut-text spark modifiers (fewer but stronger) ================= */
+    const CUT = {
+      EMIT_SCALE: 0.35,    // fewer sparks (35% of normal)
+      STREAK_GAIN: 1.25,   // longer streak render
+      CORE_GAIN: 1.35,     // brighter core render
+      SIZE_GAIN: 1.25      // slightly thicker
     };
-    const letterSparkPhase = Math.random()*Math.PI*2; // dephase the modulation
+
+    /* ================= Letter-Spark Tunables (quick bright pop) ================= */
+    const LETTER_SPARK = {
+      RATE: 80,                 // fewer letter sparks (110→80)
+      SPEED: [140, 300],
+      LIFE: [0.45, 0.7],        // quick pop/fade
+      SIZE: [1.2, 2.2],
+      ANGLE_BIAS: [-1.6, 1.6],
+      JITTER: 0.55
+    };
+    const letterSparkPhase = Math.random()*Math.PI*2;
 
     /* ================= Embers ================= */
     const EMB = {
-      MAX: 3600,
+      MAX: 3800,
       SPAWN_RATE: 2400,
-      LIFE: [0.8, 2.0],
-      SPEED: [-14, -4],
-      JX: [-16,16],
-      GRAV: -8,
-      SIZE: [1.35, 3.6],
-      GROW: [0.6, 1.4],
-      ORANGE: [255, 180, 90],
+      LIFE: [0.65, 1.6],
+      SPEED: [-16, -6],
+      JX: [-18,18],
+      GRAV: -9,
+      SIZE: [1.35, 3.8],
+      GROW: [0.7, 1.5],
+      ORANGE: [255, 190, 110],
       MINT:   [140, 255, 210],
       TAIL_RATE: 460,
-      BASE_FLAME_RATE: 640
+      BASE_FLAME_RATE: 660,
+      POP_RATE: 0.24
     };
     const embList = new Array(EMB.MAX);
     let embCount = 0;
 
     /* ================= State & Timing ================= */
-    const PHASE = { GAUSS:0, BOX_EDGE:1, BOX_JITTER:2, REVEAL:3 };
+    const PHASE = { GAUSS:0, BOX_EDGE:1, BOX_LETTER_ENTRY:2, BOX_JITTER:3, REVEAL:4 };
     let phase = PHASE.GAUSS;
 
     let last = performance.now();
     let progGaussian = 0;
     let progBoxEdge  = 0;
-    let lastUpper = null, lastBase = null;
 
-    let borderLastIdx = null;
-    let edgePrev = null;
+    // Accumulator for solid-understroke connectivity
+    let curvePrev = null;
+    let borderPrev = null;
+
+    // letter entry: random side anchors
+    const sideAnchors = makeSideAnchors(textRect, 9);
+    let entryTimer = 0, entryPoint = null, entryTarget = null;
+    const ENTRY_HOP = 0.32;
+    const ENTRY_TWEEN = 0.18;
 
     let jitterStart = 0;
     let jitterTarget = null;
@@ -235,7 +263,6 @@
     const POST_ZAP_DUR    = 3.0;
     const ZAP_RATE        = 22;
 
-    // Floors
     const GLOW_FLOOR  = 0.16;
 
     hudUpdate();
@@ -262,8 +289,6 @@
           progGaussian = 1;
           phase = PHASE.BOX_EDGE;
           hudUpdate();
-          borderLastIdx = null;
-          edgePrev = null;
         }
 
         const {i,tt,x0,y0,x1,y1} = segAt(closed, progGaussian);
@@ -271,6 +296,7 @@
         const ly = y0 + (y1-y0)*tt;
         const [txv,tyv] = tangentAt(closed, i);
 
+        // beams
         for (const src of multiLasers){
           const pulse = 0.6 + 0.4*Math.sin( (t*3.2) + src.phase*2.0 + Math.random()*0.4 );
           const p = clamp(0.25,1, basePower * (src.power || 1) * pulse);
@@ -278,22 +304,22 @@
           drawBeam(glowCtx, src.x, src.y, lx, ly, w, p, 0.0);
         }
 
-        emitSparks(lx,ly,txv,tyv,basePower,1.0,dt);
-        if (inside(lx,ly,rect)){
-          carveSlabPointAndWedge(slabCtx, lx, ly, centroid, basePower);
-        }
+        // sparks + carving
+        emitSparks(lx,ly,txv,tyv,basePower,1.0,dt,false);
+        if (inside(lx,ly,rect)) carveSlabPointAndWedge(slabCtx, lx, ly, centroid, basePower);
 
-        traceCurve(curveCtx, closed, U, N, iFromProgress(progGaussian, N), tt, lastUpper, lastBase);
-        lastUpper = window._lastUpper; lastBase = window._lastBase;
+        // CONNECTED drawing: solid under-stroke + glow stroke
+        traceSolid(curveSolidCtx, closed, i, tt, true);
+        traceGlow(curveCtx, closed, i, tt, true);
+
         drawLiveHit(liveCtx, lx, ly, 16);
       }
       else if (phase === PHASE.BOX_EDGE){
         progBoxEdge += 0.6*dt;
         if (progBoxEdge >= 1){
           progBoxEdge = 1;
-          phase = PHASE.BOX_JITTER;
-          jitterStart = nowSec;
-          jitterTarget = randomPointInRect(textRect);
+          phase = PHASE.BOX_LETTER_ENTRY;
+          entryTimer = 0;
           hudUpdate();
         }
 
@@ -309,15 +335,44 @@
           drawBeam(glowCtx, src.x, src.y, lx, ly, w, p, 0.0);
         }
 
-        emitSparks(lx,ly,txv,tyv,basePower,0.85,dt);
+        emitSparks(lx,ly,txv,tyv,basePower,0.85,dt,false);
         drawLiveHit(liveCtx, lx, ly, 13);
+        carveSlabStroke(slabCtx, x0, y0, lx, ly, 6);
 
-        if (edgePrev == null) edgePrev = {x:lx, y:ly};
-        carveSlabStroke(slabCtx, edgePrev.x, edgePrev.y, lx, ly, 6);
-        edgePrev = {x:lx, y:ly};
+        traceSolid(borderSolidCtx, boxEdgePath, i, tt, false);
+        traceGlow(borderCtx,        boxEdgePath, i, tt, false);
+      }
+      else if (phase === PHASE.BOX_LETTER_ENTRY){
+        // Random side entry → quick tween inside
+        entryTimer += dt;
+        if (!entryPoint || entryTimer >= ENTRY_HOP){
+          entryTimer = 0;
+          entryPoint  = randomSideAnchor(sideAnchors);
+          entryTarget = randomPointInRect(textRect);
+        }
+        const k = clamp(0,1, entryTimer / ENTRY_TWEEN);
+        const lx = lerp(entryPoint.x, entryTarget.x, k);
+        const ly = lerp(entryPoint.y, entryTarget.y, k);
 
-        traceBorder(borderCtx, boxEdgePath, i, tt, borderLastIdx);
-        borderLastIdx = window._lastBorderIdx;
+        for (const src of multiLasers){
+          const pulse = 0.62 + 0.38*Math.sin( (t*4.0) + src.phase*2.1 );
+          const p = clamp(0.25,1, basePower * (src.power || 1) * pulse);
+          const w = baseWidth * (src.width || 1);
+          drawBeam(glowCtx, src.x, src.y, lx, ly, w, p, 0.0);
+        }
+
+        // >>> CUT TEXT SPARKS: fewer but stronger <<<
+        emitSparks(lx,ly,0,-1,basePower, CUT.EMIT_SCALE, dt, true);
+        drawLiveHit(liveCtx, lx, ly, 11);
+        carveSlabPointAndWedge(slabCtx, lx, ly, {x:lx,y:ly}, basePower*0.55, 5);
+
+        // stochastic transition
+        if (Math.random() < 0.015){
+          phase = PHASE.BOX_JITTER;
+          jitterStart = nowSec;
+          jitterTarget = randomPointInRect(textRect);
+          hudUpdate();
+        }
       }
       else if (phase === PHASE.BOX_JITTER){
         const elapsed = nowSec - jitterStart;
@@ -334,41 +389,42 @@
           drawBeam(glowCtx, src.x, src.y, lx, ly, w, p, 0.0);
         }
 
-        emitSparks(lx,ly,0,-1,basePower,1.0,dt);
+        // >>> CUT TEXT SPARKS: fewer but stronger <<<
+        emitSparks(lx,ly,0,-1,basePower, CUT.EMIT_SCALE, dt, true);
         drawLiveHit(liveCtx, lx, ly, 10);
-        carveSlabPointAndWedge(slabCtx, lx, ly, {x:lx,y:ly}, basePower*0.4, 4);
+        carveSlabPointAndWedge(slabCtx, lx, ly, {x:lx,y:ly}, basePower*0.45, 4);
 
         if (elapsed >=  JITTER_DUR){
           phase = PHASE.REVEAL;
-          revealStart = nowSec + 0.45; // slight pause before ignite
+          revealStart = nowSec + 0.45;
           hudUpdate();
         }
       }
       else {
-        // ===== Merge beams to a single parked beam with smaller/softer final glare =====
+        // Merge beams to parked tip
         const tmerge = clamp(0,1, (nowSec - revealStart + 0.25)/0.6 );
         for (const src of multiLasers){
           const ox = lerp(src.x, parkVerticalOrigin.x, tmerge);
           const oy = lerp(src.y, parkVerticalOrigin.y, tmerge);
           const pulse = 0.6 + 0.4*Math.sin(nowSec*9 + src.phase);
           const p = clamp(0.3,1, 0.7*pulse);
-          // spread=0.75, glareScale=0.55 => smaller, softer glare circle
           drawBeam(glowCtx, ox, oy, parkPoint.x, parkPoint.y, 1.6, p, 0.75, 0.55);
         }
 
-        // Less-volume radial sparks at tip (reduced intensity + cap)
         emitSparksRadial(parkPoint.x, parkPoint.y, 0.25, dt, 160);
 
-        // ===== Ember burn-in + CONSTANT flame + post-zaps =====
+        // Reveal + embers + letter sparks
         const el = nowSec - revealStart;
         if (el > 0){
           const fade   = clamp(0,1, el / TEXT_REVEAL_DUR);
           const ignite = easeOutCubic(fade);
           const pulse  = 0.85 + 0.15*Math.sin(nowSec*8.0);
-
           const emberVis = Math.max(0.32, Math.pow(1 - fade, 1.10));
 
-          // ignition embers (front-loaded), then base/ tail flame
+          if (Math.random() < 0.24 * dt * 60){
+            letterPopBurst(textRect, textAlphaData, randInt(2,5));
+          }
+
           const spawnGain = Math.max(0, (1.0 - fade) - 0.2);
           updateEmbers(dt, spawnGain * emberVis, textRect, textAlphaData);
 
@@ -384,12 +440,12 @@
               drawBeam(glowCtx, src.x, src.y, target.x, target.y, 1.2, p, 0.35);
               drawLiveHit(liveCtx, target.x, target.y, 10);
               carveSlabPointAndWedge(slabCtx, target.x, target.y, target, 0.35, 3.5);
-              emitSparksRadial(target.x, target.y, 0.45, dt * 0.65, 140);
+              emitSparksRadial(target.x, target.y, 0.5, dt * 0.65, 140);
               updateEmbers(dt, 0.38, textRect, textAlphaData);
             }
           }
 
-          // persistent base flame + tail
+          // base/tail flame
           const baseGain = EMB.BASE_FLAME_RATE / EMB.SPAWN_RATE;
           updateEmbers(dt, baseGain, textRect, textAlphaData);
           if (el > zapWindowEnd){
@@ -397,28 +453,27 @@
             updateEmbers(dt, tailGain, textRect, textAlphaData);
           }
 
-          // >>> Letter-origin occasional sparks (new) <<<
+          // occasional letter-origin sparks
           const mod = 0.6 + 0.4*Math.sin(nowSec*1.7 + letterSparkPhase);
           emitLetterSparksFromText(LETTER_SPARK.RATE * mod, dt, textRect, textAlphaData);
 
           renderEmbers(embCtx, ignite, Math.min(1, emberVis * 1.15));
 
-          // heat bloom
+          // heat bloom → mint
           const bloom = mk(W,H), bctx = bloom.getContext('2d');
           bctx.drawImage(textMask,0,0);
           bctx.globalCompositeOperation='source-in';
-          const [r0,g0,b0] = [255,180,90], [r1,g1,b1] = [140,255,210];
+          const [r0,g0,b0] = [255,190,110], [r1,g1,b1] = [140,255,210];
           const rr = Math.round(lerp(r0,r1, ignite*0.6));
           const gg = Math.round(lerp(g0,g1, ignite*0.6));
           const bb = Math.round(lerp(b0,b1, ignite*0.6));
-          bctx.fillStyle = `rgba(${rr},${gg},${bb},${(0.36*pulse*emberVis).toFixed(3)})`;
+          bctx.fillStyle = `rgba(${rr},${gg},${bb},${(0.38*pulse*emberVis).toFixed(3)})`;
           bctx.shadowColor = `rgba(${rr},${gg},${bb},${(0.95*emberVis).toFixed(3)})`;
           bctx.shadowBlur = (20 + 20*ignite) * (0.65 + 0.35*emberVis);
           bctx.fillRect(0,0,W,H);
           revealCtx.globalCompositeOperation='lighter';
           revealCtx.drawImage(bloom,0,0);
 
-          // mint text fill
           const mint = mk(W,H), mctx = mint.getContext('2d');
           mctx.drawImage(textMask,0,0);
           mctx.globalCompositeOperation='source-in';
@@ -453,12 +508,13 @@
       ctx.drawImage(bg,0,0);
       ctx.drawImage(slab,0,0);
 
-      // Gaussian/baseline
+      // Solid under-strokes first (fills micro gaps), then glow strokes
+      ctx.globalCompositeOperation='source-over';
+      ctx.drawImage(curveSolid,0,0);
+      ctx.drawImage(borderSolid,0,0);
+
       ctx.globalCompositeOperation='screen';
       ctx.drawImage(curve,0,0);
-
-      // Neon border on top of Gaussian
-      ctx.globalCompositeOperation='screen';
       ctx.drawImage(border,0,0);
 
       // Live hits, beams/sparks, embers, reveal bloom/text, and persistent letter glow
@@ -479,10 +535,11 @@
 
     function hudUpdate(){
       hud.textContent =
-        (phase===0) ? "Phase 1/4 — Gaussian (multi-laser)"
-      : (phase===1) ? "Phase 2/4 — Text box edge (carving neon border)"
-      : (phase===2) ? "Phase 3/4 — Jitter cuts in box (multi-laser)"
-      : "Phase 4/4 — Ember mint text + constant flame + subtle tip flare + letter sparks";
+        (phase===0) ? "Phase 1/5 — Gaussian (multi-laser)"
+      : (phase===1) ? "Phase 2/5 — Text box edge (carving neon border)"
+      : (phase===2) ? "Phase 3/5 — Letter cuts: random side entry (fewer/stronger sparks)"
+      : (phase===3) ? "Phase 4/5 — Jitter cuts in box (fewer/stronger sparks)"
+      : "Phase 5/5 — Ember mint text + constant flame + subtle tip flare + letter sparks";
     }
 
     /* ================= Carving & Drawing ================= */
@@ -491,7 +548,7 @@
       g.globalCompositeOperation='destination-out';
       const rad = kerf + 1.5;
       const gr = g.createRadialGradient(lx,ly,0,lx,ly,rad);
-      gr.addColorStop(0,`rgba(0,0,0,${(0.35*power).toFixed(3)})`);
+      gr.addColorStop(0,`rgba(0,0,0,${(0.44*power).toFixed(3)})`);
       gr.addColorStop(1,'rgba(0,0,0,0)');
       g.fillStyle=gr;
       g.beginPath(); g.arc(lx,ly,kerf,0,Math.PI*2); g.fill();
@@ -501,14 +558,14 @@
       const m = Math.hypot(vx,vy)||1;
       const ux = vx/m, uy = vy/m;
       const wx = -uy, wy = ux;
-      const L = 32*(0.6+0.4*power);
+      const L = 34*(0.6+0.4*power);
       const Wd = 16;
       g.beginPath();
       g.moveTo(lx,ly);
       g.lineTo(lx+ux*L+wx*(Wd*0.5), ly+uy*L+wy*(Wd*0.5));
       g.lineTo(lx+ux*L-wx*(Wd*0.5), ly+uy*L-wy*(Wd*0.5));
       g.closePath();
-      g.fillStyle=`rgba(0,0,0,${(0.22*power).toFixed(3)})`;
+      g.fillStyle=`rgba(0,0,0,${(0.24*power).toFixed(3)})`;
       g.fill();
       g.restore();
     }
@@ -518,6 +575,7 @@
       g.globalCompositeOperation = 'destination-out';
       g.lineCap = 'round';
       g.lineJoin = 'round';
+      g.miterLimit = 2;
       g.strokeStyle = 'rgba(0,0,0,1)';
       g.lineWidth = widthPx;
       g.beginPath();
@@ -527,37 +585,28 @@
       g.restore();
     }
 
-    function traceCurve(g, closed, U, N, i, tt, lastU, lastB){
+    // Solid under-stroke tracer (strong connectivity)
+    function traceSolid(g, path, i, tt, isCurve){
+      const [x0,y0] = path[i];
+      const [x1,y1] = path[i+1] ?? path[i];
+      const x = x0 + (x1-x0)*tt;
+      const y = y0 + (y1-y0)*tt;
+      const prev = isCurve ? curvePrev : borderPrev;
+
+      g.beginPath();
+      if (prev){ g.moveTo(prev.x, prev.y); }
+      else     { g.moveTo(x, y); }
+      g.lineTo(x, y);
+      g.stroke();
+
+      if (isCurve) curvePrev = {x,y}; else borderPrev = {x,y};
+    }
+
+    // Glow tracer layered on top
+    function traceGlow(g, path, i, tt){
       const STEPS = 10;
       const idxf = i + tt;
       for (let s=0;s<=STEPS;s++){
-        const k = clamp(0, N-1-1e-4, idxf - (STEPS-s)*0.25);
-        const ki = Math.floor(k);
-        const kt = k - ki;
-        const [ax,ay] = closed[ki];
-        const [bx,by] = closed[ki+1] ?? closed[ki];
-        const sx = ax + (bx-ax)*kt;
-        const sy = ay + (by-ay)*kt;
-        g.beginPath();
-        if (ki < U-1){
-          if (lastU==null || ki<lastU || ki-lastU>50) g.moveTo(sx,sy);
-          else { const [px,py] = closed[lastU]; g.moveTo(px,py); }
-          g.lineTo(sx,sy); g.stroke(); lastU=ki; lastB=null;
-        } else {
-          if (lastB==null || ki<lastB || ki-lastB>50) g.moveTo(sx,sy);
-          else { const [px,py] = closed[lastB]; g.moveTo(px,py); }
-          g.lineTo(sx,sy); g.stroke(); lastB=ki; lastU=null;
-        }
-      }
-      window._lastUpper = lastU;
-      window._lastBase  = lastB;
-    }
-
-    function traceBorder(g, path, i, tt, lastIdx){
-      const STEPS = 10;
-      const idxf = i + tt;
-      let L = (lastIdx==null) ? Math.max(0, Math.floor(idxf) - 1) : lastIdx;
-      for (let s=0; s<=STEPS; s++){
         const k = clamp(0, path.length-1-1e-4, idxf - (STEPS-s)*0.25);
         const ki = Math.floor(k);
         const kt = k - ki;
@@ -565,18 +614,11 @@
         const [bx,by] = path[ki+1] ?? path[ki];
         const sx = ax + (bx-ax)*kt;
         const sy = ay + (by-ay)*kt;
-
         g.beginPath();
-        if (L==null || ki < L || ki - L > 50) g.moveTo(sx,sy);
-        else {
-          const [px,py] = path[L];
-          g.moveTo(px,py);
-        }
+        g.moveTo(ax,ay);
         g.lineTo(sx,sy);
         g.stroke();
-        L = ki;
       }
-      window._lastBorderIdx = L;
     }
 
     /* ========= Beam with controllable tip flare spread + glare scale ========= */
@@ -585,17 +627,17 @@
       g.globalCompositeOperation='lighter';
 
       // shaft halo
-      g.strokeStyle = `rgba(30,255,170,${(0.34*p).toFixed(3)})`;
+      g.strokeStyle = `rgba(30,255,170,${(0.38*p).toFixed(3)})`;
       g.lineWidth = w+6;
       g.lineCap='round';
       g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
 
       // shaft core
-      g.strokeStyle = `rgba(230,255,245,${(Math.max(0.04,p*0.95)).toFixed(3)})`;
+      g.strokeStyle = `rgba(230,255,245,${(Math.max(0.06,p*0.95)).toFixed(3)})`;
       g.lineWidth = w;
       g.beginPath(); g.moveTo(x0,y0); g.lineTo(x1,y1); g.stroke();
 
-      // tip bloom — scaled down by glareScale
+      // tip bloom
       const flareR = glareScale * (7 + spread*18);
       const flareA = glareScale * (0.26 + 0.14*spread);
       g.fillStyle = `rgba(30,255,170,${(flareA).toFixed(3)})`;
@@ -603,10 +645,10 @@
         g.beginPath(); g.arc(x1,y1, flareR + i*4, 0, Math.PI*2); g.fill();
       }
       // tiny core pop
-      g.fillStyle = `rgba(230,255,245,${(0.12*glareScale + 0.06*spread).toFixed(3)})`;
-      g.beginPath(); g.arc(x1,y1, 1.8 + spread*0.6, 0, Math.PI*2); g.fill();
+      g.fillStyle = `rgba(255,255,255,${(0.14*glareScale + 0.08*spread).toFixed(3)})`;
+      g.beginPath(); g.arc(x1,y1, 2.0 + spread*0.7, 0, Math.PI*2); g.fill();
 
-      // starburst spokes at tip — soften with glareScale
+      // starburst spokes
       if (spread > 0){
         const spokes = Math.floor(6 + spread*8);
         for (let k=0;k<spokes;k++){
@@ -631,17 +673,17 @@
       count = Math.min(count, SP.MAX - sparkCount, cap);
       for (let i=0;i<count;i++){
         const ang = Math.random()*Math.PI*2;
-        const spd = rand(180, 420);    // tighter, less “spray”
+        const spd = rand(180, 420);
         const vx  = Math.cos(ang) * spd + rand(-40,40);
         const vy  = Math.sin(ang) * spd + rand(-40,40);
         const life= rand(SP.LIFE[0], SP.LIFE[1]);
         const size= rand(1.1,2.7);
         newSpark(cx,cy,vx,vy,life,size);
       }
-      renderSparks(glowCtx, dt);
+      renderSparks(glowCtx, dt, false);
     }
 
-    /* ================= Letter Sparks (NEW) ================= */
+    /* ================= Letter Sparks ================= */
     function emitLetterSparksFromText(ratePerSec, dt, r, alphaData){
       const want = ratePerSec * dt;
       const count = Math.min(Math.floor(want + Math.random()), SP.MAX - sparkCount);
@@ -649,9 +691,8 @@
         const pt = pickRandomTextPoint(r, alphaData, 18);
         if (!pt) break;
 
-        // Slight upward bias with jitter
-        const baseAng = rand(LETTER_SPARK.ANGLE_BIAS[0], LETTER_SPARK.ANGLE_BIAS[1]); // around -1.1 rad (≈ up-left/up-right)
-        const jitter  = (Math.random()-0.5) * LETTER_SPARK.JITTER; // -0.225..0.225 rad
+        const baseAng = rand(LETTER_SPARK.ANGLE_BIAS[0], LETTER_SPARK.ANGLE_BIAS[1]);
+        const jitter  = (Math.random()-0.5) * LETTER_SPARK.JITTER;
         const ang = baseAng + jitter;
 
         const spd = rand(LETTER_SPARK.SPEED[0], LETTER_SPARK.SPEED[1]);
@@ -662,11 +703,22 @@
         const size = rand(LETTER_SPARK.SIZE[0], LETTER_SPARK.SIZE[1]);
 
         newSpark(pt.x, pt.y, vx, vy, life, size);
-
-        // small live hit bloom
-        drawLiveHit(liveCtx, pt.x, pt.y, 8);
+        drawLiveHit(liveCtx, pt.x, pt.y, 9);
       }
-      // draw happens in renderSparks() which is called elsewhere every frame
+      // draw in renderSparks()
+    }
+
+    /* ================= Random micro pop burst ================= */
+    function letterPopBurst(r, alphaData, n){
+      for (let i=0;i<n;i++){
+        const pt = pickRandomTextPoint(r, alphaData, 20);
+        if (!pt) continue;
+        const ang = Math.random()*Math.PI*2;
+        const spd = rand(240, 520);
+        const vx = Math.cos(ang)*spd, vy = Math.sin(ang)*spd;
+        newSpark(pt.x, pt.y, vx, vy, rand(0.35,0.6), rand(1.4,2.4));
+        drawLiveHit(liveCtx, pt.x, pt.y, 10);
+      }
     }
 
     /* ================= Embers ================= */
@@ -674,17 +726,17 @@
       if (gain <= 0) return;
 
       const want = 2400 * gain * dt;
-      const count = Math.min(Math.floor(want + Math.random()), 3600 - embCount);
+      const count = Math.min(Math.floor(want + Math.random()), 3800 - embCount);
       for (let i=0;i<count;i++){
         const pt = pickRandomTextPoint(r, alphaData, 20);
         if (!pt) continue;
-        const life = rand(0.8, 2.0);
-        const vy = rand(-14, -4);
-        const vx = rand(-16,16);
-        const size = rand(1.35, 3.6);
-        const grow = rand(0.6, 1.4);
+        const life = rand(0.65, 1.6);
+        const vy = rand(-16, -6);
+        const vx = rand(-18,18);
+        const size = rand(1.35, 3.8);
+        const grow = rand(0.7, 1.5);
 
-        if (embCount >= 3600) break;
+        if (embCount >= 3800) break;
         embList[embCount++] = { x:pt.x, y:pt.y, vx, vy, t:0, life, size, grow };
       }
 
@@ -696,7 +748,7 @@
         if (e.t >= e.life) continue;
 
         // buoyancy + micro noise
-        e.vy += -8 * dt; // upward drift
+        e.vy += -9 * dt;
         e.vx += (noise1d((e.x+e.t)*0.03)-0.5) * 8 * dt;
         e.vy += (noise1d((e.y-e.t)*0.03)-0.5) * 6 * dt;
 
@@ -718,17 +770,17 @@
         const e = embList[i];
         const k = clamp(0,1, e.t / e.life);
         const heat = Math.sin(Math.PI * Math.min(1, k));
-        const sz = e.size * (1 + e.grow * heat * 0.6);
+        const sz = e.size * (1 + e.grow * heat * 0.65);
 
-        const blend = clamp(0,1, 0.25 + 0.55*ignite + 0.35*k);
+        const blend = clamp(0,1, 0.28 + 0.58*ignite + 0.35*k);
         const r = Math.round(lerp(255, 140, blend));
-        const gg= Math.round(lerp(180, 255, blend));
-        const b = Math.round(lerp(90,  210, blend));
+        const gg= Math.round(lerp(190, 255, blend));
+        const b = Math.round(lerp(110, 210, blend));
 
-        const aCore  = (0.18 + 0.58*(1-k) + 0.28*heat) * strength;
-        const aHalo  = (0.12 + 0.48*(1-k)) * strength;
+        const aCore  = (0.24 + 0.64*(1-k) + 0.30*heat) * strength;
+        const aHalo  = (0.12 + 0.54*(1-k)) * strength;
 
-        const rad = sz*3.4 * (0.75 + 0.25*strength);
+        const rad = sz*3.6 * (0.75 + 0.25*strength);
 
         const gr = g.createRadialGradient(e.x,e.y,0, e.x,e.y,rad);
         gr.addColorStop(0,   `rgba(${r},${gg},${b},${aCore.toFixed(3)})`);
@@ -739,31 +791,33 @@
 
         // bright core
         g.fillStyle = `rgba(${r},${gg},${b},${aCore.toFixed(3)})`;
-        g.beginPath(); g.arc(e.x, e.y, sz*0.65, 0, Math.PI*2); g.fill();
+        g.beginPath(); g.arc(e.x, e.y, sz*0.7, 0, Math.PI*2); g.fill();
       }
       g.restore();
     }
 
     /* ================= Standard Sparks ================= */
-    function emitSparks(lx,ly,tx,ty,power,emit,dt){
+    // If "cutMode" is true → render fewer but stronger (CUT modifiers).
+    function emitSparks(lx,ly,tx,ty,power,emit,dt,cutMode=false){
       const nx = -ty, ny = tx;
-      const want = SP.EMIT * power * emit * dt;
+      let want = SP.EMIT * power * emit * dt;
+      if (cutMode) want *= CUT.EMIT_SCALE; // fewer
       const count = Math.min(Math.floor(want + Math.random()), SP.MAX - sparkCount);
       for (let i=0;i<count;i++){
         const vT = rand(SP.VT[0], SP.VT[1]);
         const vN = rand(SP.VN[0], SP.VN[1]);
-        const jx = rand(SP.JIT[0], SP.JIT[1]);
-        const jy = rand(SP.JIT[0], SP.JIT[1]);
+        const jx = rand(-18, 18);
+        const jy = rand(-18, 18);
         const vx = tx*vT + nx*vN + jx;
         const vy = ty*vT + ny*vN + jy;
         const life = rand(SP.LIFE[0], SP.LIFE[1]);
-        const size = rand(1.1,2.7);
-        newSpark(lx,ly,vx,vy,life,size);
+        const size = rand(1.1* (cutMode?CUT.SIZE_GAIN:1), 2.2* (cutMode?CUT.SIZE_GAIN:1));
+        newSpark(lx,ly,vx,vy,life,size, cutMode);
       }
-      renderSparks(glowCtx, dt);
+      renderSparks(glowCtx, dt, cutMode);
     }
 
-    function renderSparks(g,dt){
+    function renderSparks(g,dt,cutMode){
       g.save();
       g.globalCompositeOperation='lighter';
       const drag = Math.pow(SP.DRAG, dt*60);
@@ -778,15 +832,22 @@
           s.y = top-0.1; s.vy *= -SP.BOUNCE; s.vx *= 0.9;
         }
         if (s.x<-200 || s.x>W+200 || s.y<-200 || s.y>H+300) continue;
+
         const spd = Math.hypot(s.vx,s.vy);
-        const len = Math.max(8, spd*0.055);
-        const th  = Math.max(2, s.size*2);
+        const len = Math.max(8, spd*0.055 * (cutMode?CUT.STREAK_GAIN:1));
+        const th  = Math.max(2, s.size*2 * (cutMode?CUT.SIZE_GAIN:1));
         const ang = Math.atan2(s.vy,s.vx);
+
         g.translate(s.x,s.y); g.rotate(ang);
-        g.globalAlpha = Math.max(0, Math.min(1, s.life));
-        g.drawImage(sparkSprite, -len*0.7, -th*1.0, len*1.4, th*2.0);
-        g.globalAlpha = Math.max(0, Math.min(1, s.life*1.1));
-        g.drawImage(sparkSprite, -len*0.4, -th*0.5, len*0.8, th);
+
+        // brighter flash layer (quick fade)
+        g.globalAlpha = Math.max(0, Math.min(1, s.life*1.15 * (cutMode?CUT.CORE_GAIN:1)));
+        g.drawImage(sparkSprite, -len*0.75, -th*1.1, len*1.5, th*2.2);
+
+        // core layer
+        g.globalAlpha = Math.max(0, Math.min(1, s.life * (cutMode?CUT.CORE_GAIN:1)));
+        g.drawImage(sparkSprite, -len*0.45, -th*0.6, len*0.9, th*1.2);
+
         g.setTransform(1,0,0,1,0,0);
         sparks[write++] = s;
       }
@@ -794,9 +855,9 @@
       g.restore();
     }
 
-    function newSpark(x,y,vx,vy,life,size){
+    function newSpark(x,y,vx,vy,life,size,cut=false){
       if (sparkCount >= SP.MAX) return;
-      sparks[sparkCount++] = {x,y,vx,vy,life,size};
+      sparks[sparkCount++] = {x,y,vx,vy,life,size,cut};
     }
 
     function makeSparkSprite(){
@@ -804,8 +865,9 @@
       const c=cv.getContext('2d');
       const g=c.createRadialGradient(S/2,S/2,1, S/2,S/2,S/2);
       g.addColorStop(0,'rgba(255,255,255,1)');
-      g.addColorStop(0.15,'rgba(230,255,245,0.95)');
-      g.addColorStop(0.4,'rgba(140,255,210,0.55)');
+      g.addColorStop(0.10,'rgba(255,255,255,0.95)');
+      g.addColorStop(0.28,'rgba(230,255,245,0.85)');
+      g.addColorStop(0.5,'rgba(140,255,210,0.55)');
       g.addColorStop(1,'rgba(140,255,210,0)');
       c.fillStyle=g; c.beginPath(); c.arc(S/2,S/2,S/2,0,Math.PI*2); c.fill();
       return cv;
@@ -816,7 +878,8 @@
       g.save();
       g.globalCompositeOperation='lighter';
       const gr = g.createRadialGradient(x,y,0,x,y,r);
-      gr.addColorStop(0,'rgba(155,255,210,1)');
+      gr.addColorStop(0,'rgba(255,255,255,1)');
+      gr.addColorStop(0.35,'rgba(155,255,210,0.8)');
       gr.addColorStop(1,'rgba(0,0,0,0)');
       g.fillStyle=gr;
       g.beginPath(); g.arc(x,y,r,0,Math.PI*2); g.fill();
@@ -834,6 +897,14 @@
       ];
       return densify(pts, step);
     }
+
+    function makeSideAnchors(r, nPerSide){
+      const left = Array.from({length:nPerSide}, (_,i)=>({x:r.x, y:r.y + (i+0.5)*r.h/nPerSide}));
+      const right= Array.from({length:nPerSide}, (_,i)=>({x:r.x+r.w, y:r.y + (i+0.5)*r.h/nPerSide}));
+      const top  = Array.from({length:Math.max(2,Math.floor(nPerSide/2))}, (_,i)=>({x:r.x + (i+0.5)*r.w/Math.max(2,Math.floor(nPerSide/2)), y:r.y}));
+      return left.concat(right, top);
+    }
+    function randomSideAnchor(anchors){ return anchors[Math.floor(Math.random()*anchors.length)]; }
 
     function randomPointInRect(r){
       return { x: r.x + Math.random()*r.w, y: r.y + Math.random()*r.h };
@@ -895,10 +966,6 @@
       const [x0,y0] = path[i], [x1,y1] = path[i+1];
       return { i, tt, x0, y0, x1, y1 };
     }
-    function iFromProgress(p,N){
-      const idxf = clamp(0, N-1, p*(N-1));
-      return Math.floor(Math.min(N-2, idxf));
-    }
 
     /* ================= Utils ================= */
     function mk(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
@@ -912,6 +979,7 @@
       return data[idx] || 0;
     }
     function rand(a,b){ return a + Math.random()*(b-a); }
+    function randInt(a,b){ return Math.floor(a + Math.random()*(b-a+1)); }
     function clamp(a,b,c){ return Math.max(a, Math.min(b, c)); }
     function noise1d(x){ const i=Math.floor(x), f=x-i, u=f*f*(3-2*f); return lerp(hash(i), hash(i+1), u); }
     function hash(n){ return fract(Math.sin(n*127.1)*43758.5453123); }
